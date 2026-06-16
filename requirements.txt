@@ -1,3 +1,9 @@
 # SAU-305 core loop. Stdlib-only except the two reliability-lever libraries:
 sqlglot>=25,<31   # deterministic canonical-SQL → Snowflake/DuckDB transpile
 duckdb>=1.0       # Snowflake-dialect execution proxy for sample reconciliation
+
+# SAU-308 live-Snowflake path — OPTIONAL. The loop imports cleanly without these;
+# only scripts/verify_snowflake.py and live execution need them. Install with:
+#   pip install 'snowflake-connector-python>=3.12'
+# snowflake-connector-python>=3.12   # live connection (uncomment to enable)
+# cryptography>=42                   # only for SNOWFLAKE_PRIVATE_KEY_PATH (key-pair auth)
