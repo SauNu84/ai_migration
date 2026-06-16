@@ -1,0 +1,3 @@
+# SAU-305 core loop. Stdlib-only except the two reliability-lever libraries:
+sqlglot>=25,<31   # deterministic canonical-SQL → Snowflake/DuckDB transpile
+duckdb>=1.0       # Snowflake-dialect execution proxy for sample reconciliation

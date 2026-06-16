@@ -1,0 +1,400 @@
+"""Verification loop (SAU-305) — the whole point.
+
+Drives the generated medallion against a sample and reconciles the result against
+the source, byte/precision-exact where the manifest demands it:
+
+  1. **Extract** each table from Postgres as a *lossless text wire form* (the same
+     shape a bulk load to Snowflake uses) — no value is coerced before the typing
+     decision is made. JSON/array columns are serialized to canonical JSON text so
+     scale and leading zeros survive transit.
+  2. **Execute** the medallion in DuckDB (the Snowflake-dialect execution proxy):
+     load Bronze (all text) → run the SQLGlot-transpiled Silver (typed CASTs) → Gold.
+  3. **Reconcile** Gold against the source: per-column canonicalization by the
+     mapped reconcile strategy, then row-count + per-column **checksum** equality.
+  4. **Red flags** (hard fail regardless of run count): row loss, a NOT-NULL source
+     value turning NULL, or any exact-class mismatch (silent precision/identity loss).
+
+Why DuckDB and not live Snowflake: Phase 0 has no Snowflake account. DuckDB is an
+independent SQL engine (≠ the source) with Snowflake-like DECIMAL/timestamp semantics,
+so a transform that only worked by leaning on source-engine behavior is still caught.
+The Snowflake DDL/DML is the deliverable and is compile-checked in the Snowflake
+dialect (codegen.compile_check). VARIANT/ARRAY are stored as canonical JSON text in
+the proxy — a documented limitation; their *content* preservation is still reconciled,
+and their VARIANT/ARRAY typing is validated by the Snowflake compile gate.
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+import subprocess
+import sys
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from decimal import Decimal
+from typing import Any
+
+import duckdb
+
+from . import codegen as cg
+from . import mapper as mp
+
+# float comparison tolerances by source physical width
+_FLOAT4_SIG = 6      # REAL ~7 significant digits
+_FLOAT8_REL = 1e-12  # double precision relative tolerance
+
+
+# ── 1. Extraction (Postgres → lossless text wire form) ──────────────────────
+
+def _extract_expr(m: mp.Mapping) -> str:
+    """Per-column SQL expression producing a lossless text wire value.
+
+    Scalars → ::text (preserves numeric scale, leading zeros, tz offset). JSON/array
+    → canonical JSON text (array elements serialized as text to preserve scale)."""
+    col = f'"{m.column}"'
+    if m.reconcile == mp.RC_ARRAY_CANONICAL:
+        # JSON array of element TEXT, order-preserving; NULL array → JSON null.
+        return (
+            f"CASE WHEN {col} IS NULL THEN NULL ELSE "
+            f"(SELECT COALESCE(json_agg(e ORDER BY ord), '[]'::json)::text "
+            f" FROM unnest({col}) WITH ORDINALITY AS u(e, ord)) END"
+        )
+    if m.reconcile == mp.RC_JSON_CANONICAL:
+        return f"{col}::text"
+    return f"{col}::text"
+
+
+def extract_table(entity: str, mappings: list[mp.Mapping]) -> list[dict[str, Any]]:
+    """Extract a table from Postgres as a list of {column: text|None} rows, PK-ordered.
+
+    Uses psql (already on PATH for the SAU-303 harness) and emits one JSON object per
+    row, so values containing commas/unicode survive without delimiter games.
+    """
+    cols = sorted(mappings, key=lambda m: m.column)
+    pairs = ",\n      ".join(
+        f"'{m.column}', ({_extract_expr(m)})" for m in cols
+    )
+    has_id = any(m.column == "id" for m in cols)
+    order = 'ORDER BY "id"' if has_id else ""
+    sql = (
+        f"SELECT json_build_object(\n      {pairs}\n    )::text "
+        f'FROM "{entity}" {order}'
+    )
+    cmd = ["psql", "-X", "-tA", "-v", "ON_ERROR_STOP=1", "-c", sql]
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    if proc.returncode != 0:
+        sys.stderr.write(proc.stderr)
+        raise SystemExit(f"psql extract failed for {entity} (exit {proc.returncode})")
+    rows: list[dict[str, Any]] = []
+    for line in proc.stdout.splitlines():
+        line = line.strip()
+        if line:
+            rows.append(json.loads(line))
+    return rows
+
+
+# ── 2. Execute medallion in DuckDB ──────────────────────────────────────────
+
+def run_medallion(con: duckdb.DuckDBPyConnection, ec: cg.EntityCode,
+                  rows: list[dict[str, Any]]) -> None:
+    """Create Bronze (all text), load the wire rows, run Silver then Gold."""
+    cols = ec.text_columns  # name-sorted, matches codegen projection order
+    con.execute(ec.bronze_ddl["duckdb"])
+    if rows:
+        placeholders = ", ".join("?" for _ in cols)
+        data = [tuple(r.get(c) for c in cols) for r in rows]
+        con.executemany(
+            f'INSERT INTO "bronze_{ec.entity}" VALUES ({placeholders})', data
+        )
+    con.execute(ec.silver_sql["duckdb"])
+    con.execute(ec.gold_sql["duckdb"])
+
+
+def read_gold(con: duckdb.DuckDBPyConnection, entity: str,
+              cols: list[str]) -> list[dict[str, Any]]:
+    has_id = "id" in cols
+    order = 'ORDER BY "id"' if has_id else ""
+    quoted = ", ".join(f'"{c}"' for c in cols)
+    cur = con.execute(f'SELECT {quoted} FROM "gold_{entity}" {order}')
+    out = []
+    for row in cur.fetchall():
+        out.append({c: row[i] for i, c in enumerate(cols)})
+    return out
+
+
+# ── 3. Canonicalization by reconcile strategy ───────────────────────────────
+
+def _canon_json(v: Any) -> str | None:
+    if v is None:
+        return None
+    obj = json.loads(v) if isinstance(v, (str, bytes, bytearray)) else v
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def _canon_ts_instant(v: Any) -> str | None:
+    if v is None:
+        return None
+    if isinstance(v, datetime):
+        dt = v
+    else:
+        s = str(v).strip().replace(" ", "T", 1)
+        dt = datetime.fromisoformat(_fix_tz(s))
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).isoformat()
+
+
+def _canon_ts_wall(v: Any) -> str | None:
+    if v is None:
+        return None
+    if isinstance(v, datetime):
+        return v.replace(tzinfo=None).isoformat()
+    s = str(v).strip().replace(" ", "T", 1)
+    return datetime.fromisoformat(_fix_tz(s)).replace(tzinfo=None).isoformat()
+
+
+def _fix_tz(s: str) -> str:
+    # Postgres emits '+00' / '+02'; fromisoformat wants '+00:00'.
+    for i in range(len(s) - 1, max(len(s) - 7, 0), -1):
+        if s[i] in "+-" and (len(s) - i) == 3:
+            return s + ":00"
+    return s
+
+
+def _canon_float(v: Any, sig: int) -> str | None:
+    if v is None or v == "":
+        return None
+    f = float(v)
+    if f == 0:
+        return "0"
+    return f"{f:.{sig}g}"
+
+
+def _canon_bool(v: Any) -> str | None:
+    if v is None:
+        return None
+    s = str(v).strip().lower()
+    if s in ("t", "true", "1", "yes"):
+        return "true"
+    if s in ("f", "false", "0", "no"):
+        return "false"
+    return s
+
+
+def _canon_exact(v: Any) -> str | None:
+    if v is None:
+        return None
+    if isinstance(v, Decimal):
+        return format(v, "f")  # fixed-point, preserves scale, no sci-notation
+    return str(v)
+
+
+def canonicalize(reconcile: str, v: Any, *, source_udt: str = "") -> str | None:
+    """Map a value to its canonical comparison string for the given strategy."""
+    if reconcile == mp.RC_JSON_CANONICAL or reconcile == mp.RC_ARRAY_CANONICAL:
+        return _canon_json(v)
+    if reconcile == mp.RC_TS_INSTANT:
+        return _canon_ts_instant(v)
+    if reconcile == mp.RC_TS_WALL:
+        return _canon_ts_wall(v)
+    if reconcile == mp.RC_BOOLEAN:
+        return _canon_bool(v)
+    if reconcile == mp.RC_APPROX_FLOAT:
+        sig = _FLOAT4_SIG if source_udt in ("float4", "real") else 12
+        return _canon_float(v, sig)
+    return _canon_exact(v)
+
+
+# ── 4. Reconcile ────────────────────────────────────────────────────────────
+
+@dataclass
+class ColumnResult:
+    entity: str
+    column: str
+    reconcile: str
+    confidence: float
+    source_checksum: str
+    target_checksum: str
+    match: bool
+    n_compared: int
+    mismatches: list[dict[str, Any]] = field(default_factory=list)
+    red_flags: list[str] = field(default_factory=list)
+    flagged_lossy: bool = False
+
+
+@dataclass
+class EntityResult:
+    entity: str
+    source_rows: int
+    target_rows: int
+    row_match: bool
+    columns: list[ColumnResult]
+    exec_error: str | None = None
+
+
+def _checksum(values: list[str | None]) -> str:
+    h = hashlib.md5()
+    for i, v in enumerate(values):
+        h.update(str(i).encode())
+        h.update(b"\x1f")
+        h.update(b"\x00NULL\x00" if v is None else v.encode("utf-8"))
+        h.update(b"\x1e")
+    return h.hexdigest()
+
+
+def reconcile_entity(ec: cg.EntityCode, mappings: list[mp.Mapping],
+                     source_rows: list[dict[str, Any]],
+                     target_rows: list[dict[str, Any]],
+                     udt_by_col: dict[str, str]) -> EntityResult:
+    cols = sorted(mappings, key=lambda m: m.column)
+    col_results: list[ColumnResult] = []
+    n = min(len(source_rows), len(target_rows))
+    row_match = len(source_rows) == len(target_rows)
+
+    for m in cols:
+        udt = udt_by_col.get(m.column, "")
+        src_canon = [canonicalize(m.reconcile, r.get(m.column), source_udt=udt)
+                     for r in source_rows]
+        tgt_canon = [canonicalize(m.reconcile, r.get(m.column), source_udt=udt)
+                     for r in target_rows]
+        scs, tcs = _checksum(src_canon), _checksum(tgt_canon)
+        mismatches: list[dict[str, Any]] = []
+        red: list[str] = []
+        for i in range(n):
+            sv, tv = src_canon[i], tgt_canon[i]
+            if sv == tv:
+                continue
+            mismatches.append({"row": i, "source": sv, "target": tv})
+            # red-flag classification
+            if sv is not None and tv is None:
+                red.append(f"row {i}: NOT-NULL source value silently dropped to NULL")
+            elif m.reconcile in (mp.RC_EXACT_TEXT, mp.RC_TS_INSTANT, mp.RC_TS_WALL):
+                red.append(
+                    f"row {i}: exact-class mismatch ({m.semantic_type}) "
+                    f"'{sv}' → '{tv}' — silent precision/identity loss"
+                )
+            elif m.reconcile == mp.RC_APPROX_FLOAT:
+                red.append(
+                    f"row {i}: float drift beyond epsilon '{sv}' → '{tv}'"
+                )
+            else:
+                red.append(f"row {i}: {m.reconcile} mismatch '{sv}' → '{tv}'")
+        match = (scs == tcs) and row_match
+        col_results.append(
+            ColumnResult(
+                entity=m.entity,
+                column=m.column,
+                reconcile=m.reconcile,
+                confidence=m.confidence,
+                source_checksum=scs,
+                target_checksum=tcs,
+                match=match,
+                n_compared=n,
+                mismatches=mismatches[:10],
+                red_flags=red[:10],
+                flagged_lossy=("lossy_float" in m.flags),
+            )
+        )
+    return EntityResult(
+        entity=ec.entity,
+        source_rows=len(source_rows),
+        target_rows=len(target_rows),
+        row_match=row_match,
+        columns=col_results,
+    )
+
+
+# ── 5. Semantic guard (structural detector) ─────────────────────────────────
+# Data checksums can be *masked*: a naive mapper that changes both the type AND the
+# reconcile assertion to match its wrong belief can make corrupt values "agree" (e.g.
+# treating a no-tz timestamp as tz-aware reconciles fine under a UTC session). The
+# semantic guard compares the chosen target against the SOURCE physical type directly,
+# so a semantic change is surfaced regardless of whether the sample data happens to
+# round-trip — satisfying §8's "reconciliation that masks a semantic mismatch — surface
+# it, do not hide it."
+
+_NUMERIC_TARGET = ("NUMBER", "DECIMAL", "FLOAT", "INT", "DOUBLE")
+
+
+def semantic_guard(prop, m: mp.Mapping) -> list[str]:
+    """Structural red flags comparing source physical type ↔ chosen Snowflake target."""
+    flags: list[str] = []
+    src_dt = (prop.data_type or "").lower()
+    src_udt = (prop.udt or "").lower()
+    tgt = m.snowflake_type.upper()
+    sem = m.semantic_type
+
+    # tz-awareness must not change (no invented/dropped offset).
+    src_tz = "with time zone" in src_dt or src_udt == "timestamptz"
+    src_ntz = "without time zone" in src_dt or src_udt == "timestamp"
+    if src_ntz and ("_TZ" in tgt or tgt.endswith("TZ")) and "NTZ" not in tgt:
+        flags.append(
+            "tz-awareness INVENTED: no-tz source mapped to a tz target — an offset "
+            "would be fabricated and instants shifted"
+        )
+    if src_tz and "NTZ" in tgt:
+        flags.append("tz DROPPED: tz-aware source mapped to a no-tz target")
+
+    # textual identity must not become numeric (leading zeros / formatting lost).
+    src_textual = src_dt in ("character", "char", "character varying", "varchar", "text") \
+        or src_udt in ("bpchar", "varchar", "text")
+    if src_textual and tgt.startswith(_NUMERIC_TARGET):
+        flags.append(
+            f"textual identity COERCED to numeric ({tgt}): leading zeros / verbatim "
+            f"format ({sem}) would be lost"
+        )
+
+    # exact numeric must not become binary float.
+    if sem in ("currency_decimal", "currency_as_integer", "rate_fraction") and \
+            tgt.startswith(("FLOAT", "DOUBLE")):
+        flags.append(f"exact numeric ({sem}) mapped to binary FLOAT — precision lost")
+
+    # numeric scale must not be reduced.
+    if prop.numeric_scale and tgt.startswith(("NUMBER", "DECIMAL")) and "(" in tgt:
+        try:
+            inner = tgt[tgt.index("(") + 1:tgt.index(")")]
+            t_scale = int(inner.split(",")[1]) if "," in inner else 0
+            if t_scale < prop.numeric_scale:
+                flags.append(
+                    f"scale REDUCED {prop.numeric_scale}→{t_scale}: rounding/truncation"
+                )
+        except (ValueError, IndexError):
+            pass
+
+    # semi-structured / array must not be flattened to a scalar string.
+    if sem in ("semi_structured",) and tgt.startswith("VARCHAR"):
+        flags.append("JSON structure FLATTENED to VARCHAR — nested keys/queryability lost")
+    if sem in ("array", "array_numeric") and tgt.startswith("VARCHAR"):
+        flags.append("ARRAY flattened to a delimited VARCHAR — element structure lost")
+
+    return flags
+
+
+def run(code: dict[str, cg.EntityCode], mappings: list[mp.Mapping],
+        udt_index: dict[tuple[str, str], str]) -> list[EntityResult]:
+    """Full verification run across all entities. Fresh DuckDB per run (isolation)."""
+    by_entity: dict[str, list[mp.Mapping]] = {}
+    for m in mappings:
+        by_entity.setdefault(m.entity, []).append(m)
+
+    results: list[EntityResult] = []
+    con = duckdb.connect(":memory:")
+    con.execute("SET TimeZone='UTC'")
+    try:
+        for entity, ec in code.items():
+            ms = by_entity[entity]
+            src = extract_table(entity, ms)
+            try:
+                run_medallion(con, ec, src)
+                tgt = read_gold(con, entity, ec.text_columns)
+            except Exception as exc:  # noqa: BLE001 — a failed transform IS a caught defect
+                results.append(EntityResult(
+                    entity=entity, source_rows=len(src), target_rows=0,
+                    row_match=False, columns=[],
+                    exec_error=f"{type(exc).__name__}: {exc}",
+                ))
+                continue
+            udt_by_col = {c: udt_index.get((entity, c), "") for c in ec.text_columns}
+            results.append(reconcile_entity(ec, ms, src, tgt, udt_by_col))
+    finally:
+        con.close()
+    return results

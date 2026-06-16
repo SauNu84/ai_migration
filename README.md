@@ -1,10 +1,14 @@
 # ai_migration — Phase 0 de-risk spike
 
 Proving the **AI-mapping verification loop** for **Postgres → Snowflake** on one
-realistic schema, end-to-end (board brief §8). This repo currently holds **Phase 0,
-child #1** ([SAU-303](https://github.com/SauNu84/ai_migration)): the *input side* — a
-realistic test schema, seeded ground-truth hard columns, and a Postgres profiling
-harness that emits a structured profile artifact the core loop consumes.
+realistic schema, end-to-end (board brief §8). This repo holds:
+
+* **child #1** ([SAU-303](https://github.com/SauNu84/ai_migration)) — the *input side*:
+  a realistic test schema, seeded ground-truth hard columns, and a Postgres profiling
+  harness emitting a structured profile artifact the core loop consumes.
+* **child #2** ([SAU-305](https://github.com/SauNu84/ai_migration)) — the *core IP and
+  §8 deliverable*: the **lift → map → codegen → verification** loop and the exit-gate
+  scorecard (`GATE_READOUT.md`).
 
 ## Layout
 
@@ -15,9 +19,38 @@ profile/profile.sql       phase0_profile() — in-DB statistical profiling (SQL 
 profile/profile.py        orchestrator → artifacts/profile.json (no data egress)
 ground_truth/hard_columns.json   manifest: hard columns + expected Snowflake target (§8 calibration)
 scripts/setup.sh          one-command bring-up (create db → schema → seed → profile)
-tests/test_profile.py     acceptance tests (manifest + profile output vs ground truth)
-artifacts/profile.json    generated profile (gitignored)
+core/ontology.py          LIFT: profile → typed property graph + isolated semantic inference
+core/mapper.py            MAP: ontology property → Snowflake target + confidence
+core/codegen.py           CODEGEN: canonical SQL once → SQLGlot transpile (Snowflake + DuckDB)
+core/reconcile.py         VERIFY: execute medallion on sample, reconcile rowcount+checksum, guards
+core/gate.py              §8 exit gate orchestration + written readout
+run_loop.py               driver → ontology/mappings/SQL artifacts + GATE_READOUT.md
+tests/test_profile.py     SAU-303 acceptance tests
+tests/test_core_loop.py   SAU-305 §8 acceptance tests
+artifacts/                generated (gitignored): profile.json, ontology.json, mappings.json, sql/
 ```
+
+## The core loop (SAU-305)
+
+```bash
+pip install -r requirements.txt          # sqlglot + duckdb
+PGHOST=/tmp PGPORT=5599 PGUSER=postgres ./scripts/setup.sh   # build source + profile
+PGHOST=/tmp PGPORT=5599 PGUSER=postgres python3 run_loop.py  # lift→map→codegen→verify→gate
+PGHOST=/tmp PGPORT=5599 PGUSER=postgres python3 -m unittest tests.test_core_loop -v
+```
+
+`run_loop.py` exits 0 only when all four §8 technical criteria pass and writes
+`GATE_READOUT.md` (the pass/fail readout for the CTO Phase-1 go/no-go).
+
+**Reliability lever:** canonical SQL is generated **once** per approved ontology, then
+**SQLGlot** transpiles it deterministically to Snowflake (compile-checked, the
+byte-identical-regeneration artifact) and DuckDB (the execution proxy reconciliation
+runs against — no live Snowflake in Phase 0). The AI is isolated to the
+semantic-inference pass only; it never writes SQL. The verification loop has two
+detectors: **data reconciliation** (row-count + per-column checksum on Gold) and a
+**structural semantic guard** that surfaces type-semantics changes (tz-awareness flip,
+text→numeric coercion, scale reduction, JSON/array flattening) even when sample data
+coincidentally round-trips — so a mapping can't *mask* a semantic mismatch.
 
 ## Quickstart
 
