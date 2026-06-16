@@ -1,0 +1,138 @@
+{
+  "$schema_note": "Ground truth for the SAU-302 §8 calibration check. Each entry is a deliberately hard column: the source Postgres type, the EXPECTED-correct Snowflake target representation, the trap a naive mapper falls into, and the verification assertion the core loop (child #2) must satisfy. 'confidence_floor' is the minimum calibrated confidence the mapper should report when it gets this right.",
+  "version": "0.1.0",
+  "dialect": { "source": "postgres", "target": "snowflake" },
+  "hard_columns": [
+    {
+      "table": "app_user", "column": "ssn_last4",
+      "pg_type": "char(4)", "snowflake_target": "VARCHAR(4)",
+      "trap": "fixed-width PII with leading zeros ('0042','0007') — must NOT be coerced to NUMBER, which drops leading zeros and changes identity",
+      "category": "pii_fixed_width", "assert": "byte-identical string preserved incl. leading zeros",
+      "confidence_floor": 0.95
+    },
+    {
+      "table": "payment", "column": "card_last4",
+      "pg_type": "char(4)", "snowflake_target": "VARCHAR(4)",
+      "trap": "leading-zero last4 ('0019','0007') — numeric coercion is lossy",
+      "category": "pii_fixed_width", "assert": "string preserved", "confidence_floor": 0.95
+    },
+    {
+      "table": "api_token", "column": "token_hash",
+      "pg_type": "char(64)", "snowflake_target": "VARCHAR(64)",
+      "trap": "fixed-width hex with leading zeros; must stay textual identity",
+      "category": "fixed_width_identifier", "assert": "string preserved", "confidence_floor": 0.95
+    },
+    {
+      "table": "app_user", "column": "last_login_at",
+      "pg_type": "timestamp", "snowflake_target": "TIMESTAMP_NTZ",
+      "trap": "timestamp WITHOUT time zone — mapping to TIMESTAMP_TZ invents an offset and shifts values",
+      "category": "timestamp_tz_distinction", "assert": "wall-clock value preserved, no tz applied",
+      "confidence_floor": 0.9
+    },
+    {
+      "table": "org", "column": "created_at",
+      "pg_type": "timestamptz", "snowflake_target": "TIMESTAMP_TZ",
+      "trap": "tz-aware; offsets (+00,+02,+09) must round-trip to the same instant",
+      "category": "timestamp_tz_distinction", "assert": "same UTC instant preserved",
+      "confidence_floor": 0.9
+    },
+    {
+      "table": "invoice", "column": "total_amount",
+      "pg_type": "numeric(14,4)", "snowflake_target": "NUMBER(14,4)",
+      "trap": "high-precision currency; FLOAT mapping loses exactness at the 99999999.9999 boundary and sub-cent 0.0001",
+      "category": "currency_precision", "assert": "exact decimal, scale 4 preserved at boundaries",
+      "confidence_floor": 0.98
+    },
+    {
+      "table": "invoice", "column": "tax_rate",
+      "pg_type": "numeric(9,6)", "snowflake_target": "NUMBER(9,6)",
+      "trap": "6-dp rate (0.083325) — float rounding corrupts the 6th place",
+      "category": "rate_precision", "assert": "scale 6 preserved", "confidence_floor": 0.95
+    },
+    {
+      "table": "subscription", "column": "mrr_cents",
+      "pg_type": "bigint", "snowflake_target": "NUMBER(38,0)",
+      "trap": "money stored as integer cents (24990000) — must remain integer, never FLOAT",
+      "category": "currency_as_integer", "assert": "exact integer preserved", "confidence_floor": 0.95
+    },
+    {
+      "table": "plan", "column": "monthly_price",
+      "pg_type": "numeric(12,2)", "snowflake_target": "NUMBER(12,2)",
+      "trap": "currency; JPY plan stored 2dp though currency is zero-dp — mapper must preserve source scale, not infer from currency",
+      "category": "currency_precision", "assert": "scale 2 preserved", "confidence_floor": 0.95
+    },
+    {
+      "table": "product", "column": "weight_kg",
+      "pg_type": "real", "snowflake_target": "FLOAT",
+      "trap": "REAL (float4) 2.4500001 — FLOAT is acceptable but mapper must FLAG lossy float identity (not assert byte-equality)",
+      "category": "lossy_float", "assert": "approximate-equality within float4 epsilon; flagged lossy",
+      "confidence_floor": 0.7
+    },
+    {
+      "table": "order_item", "column": "discount_pct",
+      "pg_type": "numeric(5,4)", "snowflake_target": "NUMBER(5,4)",
+      "trap": "fraction scale-4 (0.1000) — must keep trailing-zero scale",
+      "category": "rate_precision", "assert": "scale 4 preserved", "confidence_floor": 0.9
+    },
+    {
+      "table": "customer_order", "column": "shipping_address",
+      "pg_type": "jsonb", "snowflake_target": "VARIANT",
+      "trap": "nested JSON (geo object) — flattening to VARCHAR loses structure/queryability",
+      "category": "semi_structured", "assert": "round-trips as parseable VARIANT, nested keys intact",
+      "confidence_floor": 0.85
+    },
+    {
+      "table": "product", "column": "attributes",
+      "pg_type": "jsonb", "snowflake_target": "VARIANT",
+      "trap": "JSON with unicode + emoji ('🚀') — encoding must survive",
+      "category": "semi_structured", "assert": "unicode/emoji preserved in VARIANT",
+      "confidence_floor": 0.85
+    },
+    {
+      "table": "customer_order", "column": "tags",
+      "pg_type": "text[]", "snowflake_target": "ARRAY",
+      "trap": "text array — must map to ARRAY, not a delimited VARCHAR",
+      "category": "array", "assert": "element count + values preserved as ARRAY",
+      "confidence_floor": 0.85
+    },
+    {
+      "table": "product", "column": "dimensions_cm",
+      "pg_type": "numeric(8,2)[]", "snowflake_target": "ARRAY",
+      "trap": "array of NUMERICs — elements must keep scale 2 inside the ARRAY",
+      "category": "array_numeric", "assert": "numeric elements preserve scale in ARRAY",
+      "confidence_floor": 0.8
+    },
+    {
+      "table": "audit_log", "column": "ip_address",
+      "pg_type": "inet", "snowflake_target": "VARCHAR(45)",
+      "trap": "INET (incl. IPv6 '2001:db8::8a2e:370:7334' and '::1') has no Snowflake native type — must serialize losslessly to text",
+      "category": "no_native_target", "assert": "canonical text form preserved (IPv4 + IPv6)",
+      "confidence_floor": 0.85
+    },
+    {
+      "table": "customer_order", "column": "legacy_total_text",
+      "pg_type": "varchar(32)", "snowflake_target": "VARCHAR(32)",
+      "trap": "numeric-LOOKING text ('1234.5600','89,95') — must NOT be auto-parsed to a number; comma-decimal would corrupt",
+      "category": "ambiguous_text_numeric", "assert": "kept as text verbatim; mapper must NOT infer numeric",
+      "confidence_floor": 0.8
+    },
+    {
+      "table": "app_user", "column": "email",
+      "pg_type": "varchar(320)", "snowflake_target": "VARCHAR(320)",
+      "trap": "PII; length boundary (RFC max 320) — must preserve full length, governance-tag as PII",
+      "category": "pii_text", "assert": "full value preserved, length cap honored", "confidence_floor": 0.9
+    },
+    {
+      "table": "warehouse", "column": "location_lat",
+      "pg_type": "double precision", "snowflake_target": "FLOAT",
+      "trap": "geo double — FLOAT acceptable; flag float identity not byte-equality",
+      "category": "lossy_float", "assert": "approximate-equality within float8 epsilon", "confidence_floor": 0.75
+    },
+    {
+      "table": "app_user", "column": "role",
+      "pg_type": "user_role (enum)", "snowflake_target": "VARCHAR + CHECK or reference table",
+      "trap": "Postgres enum — Snowflake has no native enum; must preserve the label set and reject unknowns",
+      "category": "enum", "assert": "enum label preserved; domain enforced via CHECK/ref", "confidence_floor": 0.85
+    }
+  ]
+}
