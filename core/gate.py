@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -244,9 +245,16 @@ def _target_compatible(got: str, expected: str) -> bool:
     # NUMBER ≡ DECIMAL synonyms
     if g.replace("NUMBER", "DECIMAL") == e.replace("NUMBER", "DECIMAL"):
         return True
-    # enum target documented as "VARCHAR + CHECK or reference table"
+    # VARCHAR family: if the manifest pins an explicit width, the width MUST match —
+    # a VARCHAR(320) where VARCHAR(4) is required is a real defect the gate must catch
+    # (e.g. ssn_last4). Only an unwidthed expected target (the enum case, documented as
+    # "VARCHAR + CHECK or reference table") accepts any VARCHAR width.
     if "VARCHAR" in e and g.startswith("VARCHAR"):
-        return True
+        e_w = re.search(r"VARCHAR\((\d+)\)", e)
+        g_w = re.search(r"VARCHAR\((\d+)\)", g)
+        if e_w is None:           # expected has no pinned width → any VARCHAR ok (enum)
+            return True
+        return g_w is not None and g_w.group(1) == e_w.group(1)
     return False
 
 

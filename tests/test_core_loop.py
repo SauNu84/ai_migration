@@ -92,6 +92,15 @@ class TestCodegen(unittest.TestCase):
     def test_snowflake_compiles(self):
         self.assertEqual(cg.compile_check(self.code), [])
 
+    def test_target_compatible_enforces_varchar_width(self):
+        # CTO gate-hardening: an explicit manifest width must match exactly; only an
+        # unwidthed (enum) target accepts any VARCHAR width.
+        self.assertTrue(gate_mod._target_compatible("VARCHAR(4)", "VARCHAR(4)"))
+        self.assertFalse(gate_mod._target_compatible("VARCHAR(320)", "VARCHAR(4)"))
+        self.assertFalse(gate_mod._target_compatible("VARCHAR", "VARCHAR(4)"))
+        self.assertTrue(
+            gate_mod._target_compatible("VARCHAR(64)", "VARCHAR + CHECK or reference table"))
+
     def test_byte_identical_regeneration(self):
         # Same ontology → identical Snowflake bytes, across independent generations.
         d1 = gate_mod._regen_digest(mp.map_ontology(self.onto))
