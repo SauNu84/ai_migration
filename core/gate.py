@@ -91,8 +91,7 @@ def _all_clean(results: list[rc.EntityResult]) -> tuple[bool, list[str]]:
     return (not problems), problems
 
 
-def _regen_digest(maps: list[mp.Mapping]) -> str:
-    code = cg.generate(maps)
+def _digest_code(code: dict[str, cg.EntityCode]) -> str:
     h = hashlib.sha256()
     for entity in sorted(code):
         ec = code[entity]
@@ -101,6 +100,39 @@ def _regen_digest(maps: list[mp.Mapping]) -> str:
             h.update(part.encode("utf-8"))
             h.update(b"\x00")
     return h.hexdigest()
+
+
+def _regen_digest(maps: list[mp.Mapping]) -> str:
+    return _digest_code(cg.generate(maps))
+
+
+def _regen_digest_from_frozen(frozen: dict[str, Any]) -> str:
+    """Regenerate SQL from the FROZEN approved ontology and digest it.
+
+    The whole path runs under `assert_no_inference`: load the frozen artifact → map →
+    codegen, never re-entering the inference seam. Raises FrozenOntologyViolation if it
+    does (SAU-312). This is the digest the Phase-1 determinism gate compares.
+    """
+    with ont.assert_no_inference():
+        onto = ont.load_frozen(frozen)
+        maps = mp.map_ontology(onto)
+        code = cg.generate(maps)
+    return _digest_code(code)
+
+
+def _frozen_integrity_enforced(frozen: dict[str, Any]) -> bool:
+    """A tampered frozen artifact must be rejected by load_frozen (content-addressed)."""
+    bad = json.loads(json.dumps(frozen))  # deep copy
+    ents = bad.get("ontology", {}).get("entities") or []
+    if ents and ents[0].get("properties"):
+        ents[0]["properties"][0]["semantic_type"] = "__tampered__"
+    else:
+        bad.setdefault("ontology", {})["source_schema"] = "__tampered__"
+    try:
+        ont.load_frozen(bad)
+        return False
+    except ont.FrozenOntologyViolation:
+        return True
 
 
 def run_gate(profile_path: str | Path, manifest_path: str | Path,
@@ -148,6 +180,36 @@ def run_gate(profile_path: str | Path, manifest_path: str | Path,
         "distinct_digests": len(digests),
         "sha256": next(iter(digests)) if len(digests) == 1 else sorted(digests),
         "method": "canonical SQL generated once per ontology; SQLGlot deterministic transpile (no LLM redraft)",
+    }
+
+    # ── Bullet 2b: byte-identical regen from the FROZEN approved ontology ────
+    # The Phase-1 criterion (SAU-312 / CTO item ②). Bullet 2 above re-lifts from the
+    # profile, which is byte-identical only because inference is a deterministic
+    # heuristic today. This bullet freezes the approved ontology and regenerates ONLY
+    # from the frozen artifact, under a guard that fails if the inference seam is
+    # re-entered — so the guarantee survives an LLM entering inference.
+    live_digest = _digest_code(code)
+    frozen = ont.freeze_ontology(onto)
+    frozen_violation: str | None = None
+    frozen_digests: set[str] = set()
+    try:
+        for _ in range(regen_iters):
+            frozen_digests.add(_regen_digest_from_frozen(frozen))
+    except ont.FrozenOntologyViolation as exc:  # inference re-entered on regen
+        frozen_violation = str(exc)
+    matches_live = len(frozen_digests) == 1 and next(iter(frozen_digests), None) == live_digest
+    integrity_enforced = _frozen_integrity_enforced(frozen)
+    gate.bullets["2b_frozen_ontology_regen"] = {
+        "pass": frozen_violation is None and matches_live and integrity_enforced,
+        "iterations": regen_iters,
+        "distinct_digests": len(frozen_digests),
+        "matches_live_generation": matches_live,
+        "inference_reentered": frozen_violation is not None,
+        "violation": frozen_violation,
+        "integrity_check_enforced": integrity_enforced,
+        "frozen_sha256": frozen["ontology_sha256"],
+        "method": "approved ontology frozen to a content-addressed artifact; regen = "
+                  "load_frozen → map → codegen under assert_no_inference (LLM seam never re-entered)",
     }
 
     # ── Bullet 3: calibrated confidence vs the hard-column manifest ──────────
@@ -280,6 +342,12 @@ def write_readout(gate: GateResult, out_path: str | Path) -> str:
     A(f"| 2 | Byte-identical SQL regeneration (SQLGlot) | "
       f"{'✅ PASS' if b2['pass'] else '❌ FAIL'} — {b2['iterations']} regenerations, "
       f"{b2['distinct_digests']} distinct digest(s) |")
+    b2f = b.get("2b_frozen_ontology_regen")
+    if b2f:
+        A(f"| 2b | Byte-identical regen from FROZEN ontology (no re-inference) | "
+          f"{'✅ PASS' if b2f['pass'] else '❌ FAIL'} — {b2f['iterations']} regens, "
+          f"{b2f['distinct_digests']} digest(s), matches live: {b2f['matches_live_generation']}, "
+          f"inference re-entered: {b2f['inference_reentered']} |")
     b3 = b["3_confidence_calibration"]
     A(f"| 3 | Calibrated confidence vs hard-column manifest | "
       f"{'✅ PASS' if b3['pass'] else '❌ FAIL'} — {b3['target_correct']}/{b3['hard_columns']} "
@@ -301,6 +369,23 @@ def write_readout(gate: GateResult, out_path: str | Path) -> str:
     A(f"- {b2['method']}")
     A(f"- SHA-256 over all Snowflake DDL/DML across {b2['iterations']} regenerations: "
       f"`{b2['sha256'] if isinstance(b2['sha256'], str) else b2['sha256']}`")
+    if b2f:
+        A("\n### 2b · Frozen-ontology regeneration (SAU-312 / CTO item ②)\n")
+        A("- Bullet 2 above re-lifts from the profile, which is byte-identical only "
+          "because inference is a deterministic heuristic today. The real guarantee is "
+          "this: the **approved ontology is frozen to a content-addressed artifact**, and "
+          "regeneration loads that artifact and re-maps + re-codegens — the inference "
+          "seam is never re-entered. The guarantee therefore survives an LLM entering "
+          "inference.")
+        A(f"- Frozen-artifact SHA-256: `{b2f['frozen_sha256']}`")
+        A(f"- {b2f['iterations']} regenerations from the frozen artifact → "
+          f"{b2f['distinct_digests']} distinct digest(s); matches the live generation: "
+          f"{b2f['matches_live_generation']}.")
+        A(f"- Inference re-entered on the regen path: **{b2f['inference_reentered']}** "
+          "(enforced by `assert_no_inference`)."
+          + (f" Violation: {b2f['violation']}" if b2f["violation"] else ""))
+        A(f"- Tampered-frozen-artifact rejected by integrity check: "
+          f"{b2f['integrity_check_enforced']}.")
 
     A("\n## 3 · Confidence calibration (hard columns)\n")
     A("| column | category | expected | got | ✓ | conf | floor | ≥floor |")

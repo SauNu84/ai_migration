@@ -20,13 +20,54 @@ deterministic SQL generation.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import re
+from contextlib import contextmanager
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Any
 
 ONTOLOGY_SCHEMA_VERSION = "0.1.0"
+
+# Envelope version for the frozen approved-ontology artifact (SAU-312).
+FROZEN_ENVELOPE_VERSION = "1.0.0"
+
+
+class FrozenOntologyViolation(RuntimeError):
+    """Raised when a frozen-ontology guarantee is broken: the inference seam was
+    re-entered on a regeneration path, or a frozen artifact failed its content-address
+    integrity check. This is the determinism invariant SAU-312 protects."""
+
+
+# ── Inference re-entry instrumentation (SAU-312) ────────────────────────────
+# Freezing the approved ontology only buys determinism if regeneration NEVER re-runs
+# inference — today inference is a deterministic heuristic, but the seam is built to
+# take an LLM, at which point re-inferring on regen would break byte-identical output.
+# This counter lets both the §8 gate and the tests *prove* inference was not re-entered
+# inside a regeneration path, rather than assuming it.
+_INFERENCE_CALLS = 0
+
+
+def inference_call_count() -> int:
+    """Total number of times the inference seam has been entered this process."""
+    return _INFERENCE_CALLS
+
+
+@contextmanager
+def assert_no_inference():
+    """Fail if the inference seam is entered inside this block.
+
+    Wrap any regenerate-from-frozen-ontology path in this guard: codegen must be a pure
+    function of the approved ontology, so any re-entry of inference is a hard defect.
+    """
+    start = _INFERENCE_CALLS
+    yield
+    if _INFERENCE_CALLS != start:
+        raise FrozenOntologyViolation(
+            f"inference seam re-entered {_INFERENCE_CALLS - start} time(s) during a "
+            "frozen-ontology regeneration; regen must read the approved ontology only"
+        )
 
 # ── Semantic type vocabulary ────────────────────────────────────────────────
 # These are the *meanings* the mapper turns into Snowflake physical types. They
@@ -194,7 +235,12 @@ def infer_property(col: dict[str, Any], *, is_pk: bool, is_fk: bool,
     strong corroborating signals scores high; a type that hinges on a judgment call
     (numeric-looking text, lossy floats, enum-without-native-target) scores lower,
     so low confidence correlates with the seeded hard columns (§8 calibration).
+
+    This is THE inference seam. The call is counted so a frozen-ontology regeneration
+    can prove it was never re-entered (SAU-312); an LLM classifier would plug in here.
     """
+    global _INFERENCE_CALLS
+    _INFERENCE_CALLS += 1
     name = col["name"]
     dt = (col.get("data_type") or "").lower()
     udt = (col.get("udt") or "").lower()
@@ -483,6 +529,106 @@ def validate(ontology: Ontology) -> list[str]:
 
 def load_profile(path: str | Path) -> dict[str, Any]:
     return json.loads(Path(path).read_text())
+
+
+# ── Frozen-ontology boundary (SAU-312) ──────────────────────────────────────
+# The approved ontology is the human-approval boundary. Once approved it is frozen to
+# an immutable, content-addressed artifact; ALL regeneration deserializes the frozen
+# artifact and re-maps + re-codegens from it — inference is never re-run. That is what
+# keeps byte-identical regeneration true after an LLM enters the inference seam.
+
+def ontology_from_json(doc: dict[str, Any]) -> Ontology:
+    """Deserialize a persisted ontology JSON back into an Ontology.
+
+    Pure structural reconstruction — it does NOT call `lift`/`infer_property`, so it is
+    safe to use on the regeneration path. Round-trips losslessly with `Ontology.to_json`.
+    """
+    entities: list[Entity] = []
+    for e in doc.get("entities", []):
+        props: list[Property] = []
+        for p in e.get("properties", []):
+            props.append(
+                Property(
+                    name=p["name"],
+                    ordinal=p.get("ordinal", 0),
+                    data_type=p.get("data_type", ""),
+                    udt=p.get("udt", ""),
+                    nullable=bool(p.get("nullable", True)),
+                    char_max_len=p.get("char_max_len"),
+                    numeric_precision=p.get("numeric_precision"),
+                    numeric_scale=p.get("numeric_scale"),
+                    null_count=p.get("null_count", 0),
+                    null_rate=p.get("null_rate", 0.0),
+                    distinct_count=p.get("distinct_count"),
+                    min=p.get("min"),
+                    max=p.get("max"),
+                    semantic_type=p.get("semantic_type", SEM_FREE_TEXT),
+                    confidence=p.get("confidence", 0.0),
+                    governance_tags=list(p.get("governance_tags", [])),
+                    signals=list(p.get("signals", [])),
+                )
+            )
+        entities.append(Entity(name=e["name"], row_count=e.get("row_count"), properties=props))
+    relationships = [
+        Relationship(
+            name=r["name"],
+            from_entity=r["from_entity"],
+            from_columns=list(r.get("from_columns", [])),
+            to_entity=r["to_entity"],
+            to_columns=list(r.get("to_columns", [])),
+        )
+        for r in doc.get("relationships", [])
+    ]
+    return Ontology(
+        schema_version=doc.get("schema_version", ONTOLOGY_SCHEMA_VERSION),
+        source_schema=doc.get("source_schema", "public"),
+        entities=entities,
+        relationships=relationships,
+    )
+
+
+def _canonical_bytes(doc: dict[str, Any]) -> bytes:
+    """Stable canonical serialization for content-addressing (key-sorted, compact)."""
+    return json.dumps(doc, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+
+def ontology_digest(onto_or_doc: "Ontology | dict[str, Any]") -> str:
+    doc = onto_or_doc.to_json() if isinstance(onto_or_doc, Ontology) else onto_or_doc
+    return hashlib.sha256(_canonical_bytes(doc)).hexdigest()
+
+
+def freeze_ontology(onto: Ontology) -> dict[str, Any]:
+    """Freeze an approved ontology into an immutable, content-addressed envelope.
+
+    The envelope carries the ontology document plus its SHA-256, so any later read can
+    verify it has not been tampered with and regeneration is provably from the artifact
+    that was approved.
+    """
+    doc = onto.to_json()
+    return {
+        "frozen_envelope_version": FROZEN_ENVELOPE_VERSION,
+        "ontology_schema_version": onto.schema_version,
+        "ontology_sha256": ontology_digest(doc),
+        "ontology": doc,
+    }
+
+
+def load_frozen(src: "str | Path | dict[str, Any]") -> Ontology:
+    """Load + integrity-check a frozen ontology envelope, returning the Ontology.
+
+    Raises FrozenOntologyViolation if the stored digest does not match the content
+    (content-addressing: a tampered frozen artifact is rejected). Never re-infers.
+    """
+    env = json.loads(Path(src).read_text()) if isinstance(src, (str, Path)) else src
+    doc = env["ontology"]
+    expected = env.get("ontology_sha256")
+    actual = ontology_digest(doc)
+    if expected is not None and expected != actual:
+        raise FrozenOntologyViolation(
+            f"frozen ontology integrity check failed: stored {expected[:12]}… "
+            f"!= recomputed {actual[:12]}…"
+        )
+    return ontology_from_json(doc)
 
 
 if __name__ == "__main__":  # pragma: no cover - manual smoke

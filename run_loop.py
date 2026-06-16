@@ -42,9 +42,15 @@ def main() -> int:
     # Persist the lifted ontology + mappings + generated SQL (the approvable artifacts).
     profile = ont.load_profile(args.profile)
     onto = ont.lift(profile)
-    maps = mp.map_ontology(onto)
-    code = cg.generate(maps)
+    # Freeze the approved ontology at the human-approval boundary (SAU-312), then run the
+    # canonical codegen path FROM the frozen artifact — never re-inferring. The guard
+    # makes that discipline executable, not just documented.
+    frozen = ont.freeze_ontology(onto)
+    with ont.assert_no_inference():
+        maps = mp.map_ontology(ont.load_frozen(frozen))
+        code = cg.generate(maps)
     (out / "ontology.json").write_text(json.dumps(onto.to_json(), indent=2) + "\n")
+    (out / "ontology.frozen.json").write_text(json.dumps(frozen, indent=2) + "\n")
     (out / "mappings.json").write_text(
         json.dumps([m.to_json() for m in maps], indent=2) + "\n"
     )

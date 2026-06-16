@@ -134,6 +134,58 @@ class TestSemanticGuard(unittest.TestCase):
         self.assertTrue(rc.semantic_guard(ntz, bad))
 
 
+@unittest.skipUnless(PROFILE.exists(), "artifacts/profile.json not generated")
+class TestFrozenOntologyDeterminism(unittest.TestCase):
+    """SAU-312 / CTO item ②: regeneration reads the FROZEN approved ontology and must
+    NEVER re-enter the inference seam — the guarantee that holds once an LLM plugs in."""
+
+    def setUp(self):
+        _, _, self.onto, self.maps = _load()
+        self.frozen = ont.freeze_ontology(self.onto)
+
+    def test_freeze_roundtrip_is_lossless(self):
+        restored = ont.load_frozen(self.frozen)
+        self.assertEqual(restored.to_json(), self.onto.to_json())
+
+    def test_frozen_envelope_is_content_addressed(self):
+        self.assertEqual(self.frozen["ontology_sha256"], ont.ontology_digest(self.onto))
+        self.assertEqual(self.frozen["frozen_envelope_version"], ont.FROZEN_ENVELOPE_VERSION)
+
+    def test_regen_from_frozen_is_byte_identical_to_live(self):
+        self.assertEqual(
+            gate_mod._regen_digest_from_frozen(self.frozen),
+            gate_mod._regen_digest(self.maps),
+        )
+
+    def test_regen_from_frozen_never_invokes_inference(self):
+        # Hard proof: detonate the inference seam, then regenerate from the frozen
+        # artifact. If regen re-inferred, this raises; it must not.
+        before = ont.inference_call_count()
+        orig = ont.infer_property
+
+        def _boom(*a, **k):  # pragma: no cover - must never run
+            raise AssertionError("inference seam re-entered during frozen regen")
+
+        ont.infer_property = _boom
+        try:
+            digest = gate_mod._regen_digest_from_frozen(self.frozen)
+        finally:
+            ont.infer_property = orig
+        self.assertEqual(digest, gate_mod._regen_digest(self.maps))
+        self.assertEqual(ont.inference_call_count(), before)  # zero inference calls
+
+    def test_assert_no_inference_guard_catches_a_relift(self):
+        with self.assertRaises(ont.FrozenOntologyViolation):
+            with ont.assert_no_inference():
+                ont.lift(json.loads(PROFILE.read_text()))
+
+    def test_tampered_frozen_artifact_is_rejected(self):
+        bad = json.loads(json.dumps(self.frozen))  # deep copy
+        bad["ontology"]["entities"][0]["properties"][0]["semantic_type"] = "__tampered__"
+        with self.assertRaises(ont.FrozenOntologyViolation):
+            ont.load_frozen(bad)
+
+
 @unittest.skipUnless(_pg_reachable(), "no Postgres reachable (set libpq env vars)")
 class TestVerificationLoopDB(unittest.TestCase):
     def test_full_gate_passes(self):
