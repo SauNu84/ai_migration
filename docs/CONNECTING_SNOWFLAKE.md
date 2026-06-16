@@ -52,13 +52,11 @@ path (see the linked board approval on SAU-308):
 1. **Snowflake 30-day free trial** — Standard edition, ~$400 credits, **no credit card
    and zero budget**, which is ample for this spike. Choose a region close to the run
    environment; record it in the Account Identifier.
-2. After activation, provision the minimal objects:
-   ```sql
-   CREATE WAREHOUSE IF NOT EXISTS MIGRATION_WH
-     WAREHOUSE_SIZE = XSMALL AUTO_SUSPEND = 60 AUTO_RESUME = TRUE INITIALLY_SUSPENDED = TRUE;
-   CREATE DATABASE  IF NOT EXISTS MIGRATION_SPIKE;
-   -- A dedicated low-privilege loader role/user is preferred over ACCOUNTADMIN.
-   ```
+2. After activation, provision the minimal objects by running
+   [`snowflake/00_provision.sql`](../snowflake/00_provision.sql) in Snowsight. It is
+   **role-consistent** (`USE ROLE SYSADMIN` first) so the role the loop connects with
+   actually owns/USEs the warehouse and database — creating them implicitly as
+   ACCOUNTADMIN would pass connectivity but fail the live run "not authorized".
    `AUTO_SUSPEND = 60` keeps trial credit burn negligible between runs.
 3. Land the credentials per **Where secrets live** above, then run
    `python3 scripts/verify_snowflake.py` and confirm exit `0`.

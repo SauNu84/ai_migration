@@ -60,10 +60,28 @@ def main() -> int:
         print(f"  region            : {region}")
         print(f"  warehouse         : {warehouse}")
         print(f"  role              : {role}")
-        return 0
     except Exception as exc:  # noqa: BLE001
         print(f"[verify_snowflake] CONNECTED but query failed: "
               f"{type(exc).__name__}: {exc}", file=sys.stderr)
+        return 4
+
+    # Loop-readiness: a green auth check is not enough — the configured role must be
+    # able to USE the warehouse/database the medallion runs against. This catches the
+    # common gotcha where objects created as ACCOUNTADMIN aren't visible to SYSADMIN,
+    # which would otherwise fail mid-run *after* a passing connectivity check.
+    try:
+        if cfg.warehouse:
+            cur.execute(f'USE WAREHOUSE "{cfg.warehouse}"')
+        if cfg.database:
+            cur.execute(f'USE DATABASE "{cfg.database}"')
+        if cfg.warehouse or cfg.database:
+            print("[verify_snowflake] LOOP-READY: configured warehouse/database are usable")
+        return 0
+    except Exception as exc:  # noqa: BLE001
+        print(f"[verify_snowflake] CONNECTED but warehouse/database NOT usable by role "
+              f"'{role}': {type(exc).__name__}: {exc}\n"
+              f"  Fix: provision objects as the connecting role — run "
+              f"snowflake/00_provision.sql (USE ROLE SYSADMIN).", file=sys.stderr)
         return 4
     finally:
         conn.close()
