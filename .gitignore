@@ -5,7 +5,11 @@ artifacts/*.json
 __pycache__/
 *.pyc
 .venv/
+.venv-orch/
 venv/
+
+# SAU-304 orchestration spike scratch (dagster home, run logs)
+.orch-tmp/
 
 # Env / secrets — never commit
 .env

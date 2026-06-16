@@ -1,0 +1,4 @@
+# SAU-304 orchestration bake-off spikes.
+# Pinned to the versions the spikes were validated against (2026-06-16).
+temporalio>=1.7,<2      # validated on 1.18.2 — durable workflow + time-skipping test env
+dagster>=1.7,<2         # validated on 1.12.1 — software-defined assets + asset checks
