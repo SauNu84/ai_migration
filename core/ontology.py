@@ -124,6 +124,7 @@ class Property:
     char_max_len: int | None
     numeric_precision: int | None
     numeric_scale: int | None
+    datetime_precision: int | None
     null_count: int
     null_rate: float
     distinct_count: int | None
@@ -470,6 +471,7 @@ def lift(profile: dict[str, Any], dialect: "dl.SourceDialect | None" = None) -> 
                     char_max_len=c.get("char_max_len"),
                     numeric_precision=c.get("numeric_precision"),
                     numeric_scale=c.get("numeric_scale"),
+                    datetime_precision=c.get("datetime_precision"),
                     null_count=c.get("null_count", 0),
                     null_rate=c.get("null_rate", 0.0),
                     distinct_count=c.get("distinct_count"),
@@ -593,6 +595,7 @@ def ontology_from_json(doc: dict[str, Any]) -> Ontology:
                     char_max_len=p.get("char_max_len"),
                     numeric_precision=p.get("numeric_precision"),
                     numeric_scale=p.get("numeric_scale"),
+                    datetime_precision=p.get("datetime_precision"),
                     null_count=p.get("null_count", 0),
                     null_rate=p.get("null_rate", 0.0),
                     distinct_count=p.get("distinct_count"),

@@ -44,6 +44,7 @@ BEGIN
         char_max_len      int      NULL,
         numeric_precision int      NULL,
         numeric_scale     int      NULL,
+        datetime_precision int     NULL,
         nullable          bit,
         null_count        bigint   NULL,
         distinct_count    bigint   NULL,
@@ -53,7 +54,7 @@ BEGIN
 
     -- Seed the metadata rows from INFORMATION_SCHEMA, applying the three normalisations.
     INSERT INTO #cols (table_name, column_name, ordinal, data_type, udt, char_max_len,
-                       numeric_precision, numeric_scale, nullable)
+                       numeric_precision, numeric_scale, datetime_precision, nullable)
     SELECT
         c.TABLE_NAME,
         c.COLUMN_NAME,
@@ -82,6 +83,10 @@ BEGIN
         END,
         c.NUMERIC_PRECISION,
         c.NUMERIC_SCALE,
+        -- datetime_precision: fractional-second digits for DATETIME2/DATETIMEOFFSET/TIME
+        -- (DATETIME2(7) → 7, legacy DATETIME → 3). Pins the Snowflake TIMESTAMP_*(p) so
+        -- the target type asserts the exact precision, not just the family.
+        c.DATETIME_PRECISION,
         CASE WHEN c.IS_NULLABLE = 'YES' THEN 1 ELSE 0 END
     FROM INFORMATION_SCHEMA.COLUMNS c
     JOIN INFORMATION_SCHEMA.TABLES t
@@ -210,6 +215,7 @@ BEGIN
                     c.char_max_len      AS [char_max_len],
                     c.numeric_precision AS [numeric_precision],
                     c.numeric_scale     AS [numeric_scale],
+                    c.datetime_precision AS [datetime_precision],
                     c.null_count        AS [null_count],
                     CASE WHEN rc.row_count > 0 AND c.null_count IS NOT NULL
                          THEN CAST(ROUND(1.0 * c.null_count / rc.row_count, 6) AS decimal(9,6))

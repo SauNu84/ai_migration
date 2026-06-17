@@ -1,6 +1,7 @@
 # Profiling + core-loop output are generated artifacts (scripts/setup.sh, run_loop.py).
 artifacts/*.json
 artifacts/sql/
+artifacts/sql.*/
 
 # Python
 __pycache__/

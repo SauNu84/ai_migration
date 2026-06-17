@@ -21,11 +21,30 @@ The DB-backed cross-dialect §8 gate run is a separate child (SAU-321 child 4).
 from __future__ import annotations
 
 import unittest
+from pathlib import Path
 
 from core import dialect as dl
 from core import ontology as ont
 from core import mapper as mp
 from core import reconcile as rc
+from core import gate as gate_mod
+
+ROOT = Path(__file__).resolve().parent.parent
+SS_PROFILE = ROOT / "artifacts" / "profile.sqlserver.json"
+SS_MANIFEST = ROOT / "sqlserver" / "ground_truth" / "hard_columns.sqlserver.json"
+
+
+def _sqlserver_reachable() -> bool:
+    """True if the SAU-323 SQL Server seed is reachable via the configured sqlcmd
+    (host binary or the rig adapter in $SQLCMD). DB-backed §8 tests skip otherwise."""
+    try:
+        out = dl.SqlServerDialect()._sqlcmd("SET NOCOUNT ON; SELECT 1 AS one;",
+                                            context="reachability")
+        return "1" in out
+    except SystemExit:
+        return False
+    except Exception:
+        return False
 
 
 # ── A synthetic SQL Server profile fixture (what profile.sqlserver.sql emits) ────
@@ -35,12 +54,13 @@ from core import reconcile as rc
 # 36 for uniqueidentifier and null for nvarchar(max).
 
 def _c(name, ordinal, data_type, *, udt=None, clen=None, prec=None, scale=None,
-       nullable=True, mn=None, mx=None):
+       dtp=None, nullable=True, mn=None, mx=None):
     return {
         "name": name, "ordinal": ordinal, "data_type": data_type,
         "udt": udt if udt is not None else data_type,
         "nullable": nullable, "char_max_len": clen,
         "numeric_precision": prec, "numeric_scale": scale,
+        "datetime_precision": dtp,
         "null_count": 0, "null_rate": 0.0, "distinct_count": 3, "min": mn, "max": mx,
     }
 
@@ -51,7 +71,7 @@ def _sqlserver_profile() -> dict:
         {"table": "company", "row_count": 4, "columns": [
             _c("id", 1, "uniqueidentifier", clen=36, nullable=False, mn=G1, mx=G3),
             _c("name", 2, "nvarchar", clen=255, nullable=False),
-            _c("created_at", 3, "datetimeoffset", nullable=False),
+            _c("created_at", 3, "datetimeoffset", dtp=7, nullable=False),
             _c("row_version", 4, "timestamp", clen=8, nullable=False),
         ]},
         {"table": "gl_account", "row_count": 8, "columns": [
@@ -62,8 +82,8 @@ def _sqlserver_profile() -> dict:
         ]},
         {"table": "journal_entry", "row_count": 3, "columns": [
             _c("id", 1, "uniqueidentifier", clen=36, nullable=False),
-            _c("entered_at", 2, "datetime", nullable=False),
-            _c("posted_at", 3, "datetime2", nullable=False),
+            _c("entered_at", 2, "datetime", dtp=3, nullable=False),
+            _c("posted_at", 3, "datetime2", dtp=7, nullable=False),
         ]},
         {"table": "journal_line", "row_count": 6, "columns": [
             _c("id", 1, "bigint", nullable=False),
@@ -95,7 +115,7 @@ def _sqlserver_profile() -> dict:
             _c("premium", 2, "money", prec=19, scale=4, nullable=False,
                mn="0.0001", mx="999999.9999"),
             _c("policy_fee", 3, "smallmoney", prec=10, scale=4, nullable=False),
-            _c("effective_at", 4, "datetimeoffset", nullable=False),
+            _c("effective_at", 4, "datetimeoffset", dtp=7, nullable=False),
             _c("legacy_premium_text", 5, "varchar", clen=32, mn="0.0001", mx="899,50"),
         ]},
         {"table": "coverage", "row_count": 4, "columns": [
@@ -106,7 +126,7 @@ def _sqlserver_profile() -> dict:
         {"table": "claim", "row_count": 3, "columns": [
             _c("id", 1, "uniqueidentifier", clen=36, nullable=False),
             _c("reserve_amount", 2, "float", mn="1000.0", mx="499999.9999999"),
-            _c("reported_at", 3, "datetime2", nullable=False),
+            _c("reported_at", 3, "datetime2", dtp=7, nullable=False),
             _c("metadata_json", 4, "nvarchar", udt="json", clen=None),
         ]},
         {"table": "claim_payment", "row_count": 3, "columns": [
@@ -310,10 +330,10 @@ class TestSqlServerLiftToSameIR(unittest.TestCase):
     # (table, column): (semantic, snowflake_type, reconcile, floor, tags, flags)
     EXPECT = {
         ("company", "id"): (ont.SEM_FREE_TEXT, "VARCHAR(36)", mp.RC_EXACT_TEXT, 0.9, [], []),
-        ("company", "created_at"): (ont.SEM_TIMESTAMP_TZ, "TIMESTAMP_TZ", mp.RC_TS_INSTANT, 0.9, [], []),
+        ("company", "created_at"): (ont.SEM_TIMESTAMP_TZ, "TIMESTAMP_TZ(7)", mp.RC_TS_INSTANT, 0.9, [], []),
         ("company", "row_version"): (ont.SEM_BINARY, "BINARY(8)", mp.RC_EXACT_TEXT, 0.9, [], []),
-        ("journal_entry", "entered_at"): (ont.SEM_TIMESTAMP_NTZ, "TIMESTAMP_NTZ", mp.RC_TS_WALL, 0.85, [], []),
-        ("journal_entry", "posted_at"): (ont.SEM_TIMESTAMP_NTZ, "TIMESTAMP_NTZ", mp.RC_TS_WALL, 0.9, [], []),
+        ("journal_entry", "entered_at"): (ont.SEM_TIMESTAMP_NTZ, "TIMESTAMP_NTZ(3)", mp.RC_TS_WALL, 0.85, [], []),
+        ("journal_entry", "posted_at"): (ont.SEM_TIMESTAMP_NTZ, "TIMESTAMP_NTZ(7)", mp.RC_TS_WALL, 0.9, [], []),
         ("journal_line", "debit"): (ont.SEM_CURRENCY_DECIMAL, "NUMBER(19,4)", mp.RC_EXACT_TEXT, 0.95, [], []),
         ("policyholder", "full_name"): (ont.SEM_PII_NAME, "VARCHAR(200)", mp.RC_EXACT_TEXT, 0.9, ["PII"], []),
         ("policyholder", "email"): (ont.SEM_PII_EMAIL, "VARCHAR(320)", mp.RC_EXACT_TEXT, 0.9, ["PII"], []),
@@ -324,11 +344,11 @@ class TestSqlServerLiftToSameIR(unittest.TestCase):
         ("product_catalog", "attributes_json"): (ont.SEM_SEMI_STRUCTURED, "VARIANT", mp.RC_JSON_CANONICAL, 0.85, [], []),
         ("policy", "premium"): (ont.SEM_CURRENCY_DECIMAL, "NUMBER(19,4)", mp.RC_EXACT_TEXT, 0.98, [], []),
         ("policy", "policy_fee"): (ont.SEM_CURRENCY_DECIMAL, "NUMBER(10,4)", mp.RC_EXACT_TEXT, 0.95, [], []),
-        ("policy", "effective_at"): (ont.SEM_TIMESTAMP_TZ, "TIMESTAMP_TZ", mp.RC_TS_INSTANT, 0.9, [], []),
+        ("policy", "effective_at"): (ont.SEM_TIMESTAMP_TZ, "TIMESTAMP_TZ(7)", mp.RC_TS_INSTANT, 0.9, [], []),
         ("policy", "legacy_premium_text"): (ont.SEM_AMBIGUOUS_TEXT, "VARCHAR(32)", mp.RC_EXACT_TEXT, 0.8, [], ["do_not_parse_numeric"]),
         ("coverage", "limit_amount"): (ont.SEM_CURRENCY_DECIMAL, "NUMBER(18,2)", mp.RC_EXACT_TEXT, 0.95, [], []),
         ("claim", "reserve_amount"): (ont.SEM_LOSSY_FLOAT, "FLOAT", mp.RC_APPROX_FLOAT, 0.7, [], ["lossy_float"]),
-        ("claim", "reported_at"): (ont.SEM_TIMESTAMP_NTZ, "TIMESTAMP_NTZ", mp.RC_TS_WALL, 0.9, [], []),
+        ("claim", "reported_at"): (ont.SEM_TIMESTAMP_NTZ, "TIMESTAMP_NTZ(7)", mp.RC_TS_WALL, 0.9, [], []),
         ("claim", "metadata_json"): (ont.SEM_SEMI_STRUCTURED, "VARIANT", mp.RC_JSON_CANONICAL, 0.85, [], []),
         ("claim_payment", "fee"): (ont.SEM_CURRENCY_DECIMAL, "NUMBER(10,4)", mp.RC_EXACT_TEXT, 0.95, [], []),
         ("transaction_ledger", "amount"): (ont.SEM_CURRENCY_DECIMAL, "NUMBER(19,4)", mp.RC_EXACT_TEXT, 0.95, [], []),
@@ -365,12 +385,52 @@ class TestSqlServerLiftToSameIR(unittest.TestCase):
 
     def test_no_semantic_guard_false_alarms_on_correct_mapping(self):
         # The structural guard must raise ZERO flags on the correct SQL Server mapping
-        # (nothing hidden), exactly as on the Postgres lane.
+        # (nothing hidden), exactly as on the Postgres lane. Exercised with the SQL Server
+        # dialect so the guard branches on real SQL Server tokens, not the Postgres ones.
+        ssd = dl.SqlServerDialect()
         for m in self.maps:
             self.assertEqual(
-                rc.semantic_guard(self.props[(m.entity, m.column)], m), [],
+                rc.semantic_guard(self.props[(m.entity, m.column)], m, dialect=ssd), [],
                 f"false alarm on {m.entity}.{m.column}",
             )
+
+    def test_guard_catches_sqlserver_masked_traps(self):
+        # The two SQL Server masked-mismatch traps the §8 gate exists to catch: a no-tz
+        # DATETIME/DATETIME2 lured to a tz target (reconciles clean under UTC), and a
+        # ROWVERSION misread as a temporal type. Both must be surfaced by the guard.
+        ssd = dl.SqlServerDialect()
+        ntz = self.props[("journal_entry", "entered_at")]
+        ntz_bad = mp.Mapping("journal_entry", "entered_at", "datetime", ont.SEM_TIMESTAMP_NTZ,
+                             "TIMESTAMP_TZ", mp.RC_TS_INSTANT, 0.85, [], [], "")
+        self.assertTrue(rc.semantic_guard(ntz, ntz_bad, dialect=ssd))
+        rv = self.props[("audit_trail", "row_version")]
+        rv_bad = mp.Mapping("audit_trail", "row_version", "timestamp", ont.SEM_BINARY,
+                            "TIMESTAMP_NTZ", mp.RC_TS_WALL, 0.9, [], [], "")
+        self.assertTrue(rc.semantic_guard(rv, rv_bad, dialect=ssd))
+
+
+@unittest.skipUnless(_sqlserver_reachable() and SS_PROFILE.exists(),
+                     "no SQL Server seed reachable (start the SAU-323 container + set "
+                     "$SQLCMD to sqlserver/scripts/sqlcmd-rig.sh and MSSQL_* env)")
+class TestSqlServerGateDB(unittest.TestCase):
+    """SAU-325 child 4: the DB-backed cross-dialect §8 gate run against the live SAU-323
+    seed — the board-funded correctness proof. Source swap only; target/codegen/gate/
+    reconcile reused verbatim."""
+
+    def test_full_gate_passes_on_sqlserver_seed(self):
+        gate, _ = gate_mod.run_gate(SS_PROFILE, SS_MANIFEST, clean_runs=3, regen_iters=3,
+                                    dialect=dl.SqlServerDialect())
+        for name, b in gate.bullets.items():
+            self.assertTrue(b["pass"], f"§8 bullet failed: {name}: {b}")
+        self.assertTrue(gate.passed)
+
+    def test_all_sqlserver_traps_caught_zero_false_alarms(self):
+        gate, _ = gate_mod.run_gate(SS_PROFILE, SS_MANIFEST, clean_runs=1, regen_iters=1,
+                                    dialect=dl.SqlServerDialect())
+        b4 = gate.bullets["4_hard_fail_detection"]
+        self.assertEqual(b4["traps_caught"], b4["traps_injected"])
+        self.assertGreater(b4["traps_injected"], 0)
+        self.assertEqual(b4["false_alarms_on_correct_mapping"], [])
 
 
 if __name__ == "__main__":

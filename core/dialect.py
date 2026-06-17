@@ -287,8 +287,15 @@ class SqlServerDialect(SourceDialect):
         user = os.environ.get("MSSQL_USER", "sa")
         db = os.environ.get("MSSQL_DATABASE", "phase1")
         binary = os.environ.get("SQLCMD", "sqlcmd")
+        # Output flags: `-y 0` = unbounded variable-width columns (no 256-char truncation,
+        # no line-wrap), the one lossless mode common to both the classic ODBC sqlcmd and
+        # the go/ODBC-18 sqlcmd bundled in the MS SQL 2022 image. (That newer sqlcmd
+        # rejects the classic `-h -1 -y 0 -Y 0 -W` combo: `-h`+`-y 0` and `-W`+`-y` are
+        # mutually exclusive there.) `-h -1` is omitted because it conflicts with `-y 0`;
+        # any header line a flavour still prints is dropped by the `{`-prefixed row filter
+        # in extract_rows, so the wire form stays losslessly parseable on either tool.
         cmd = [binary, "-S", f"{host},{port}", "-U", user, "-P", pwd, "-d", db,
-               "-C", "-b", "-h", "-1", "-y", "0", "-Y", "0", "-W"]
+               "-C", "-b", "-y", "0"]
         if input_file is not None:
             cmd += ["-i", input_file]
         else:
@@ -341,8 +348,13 @@ class SqlServerDialect(SourceDialect):
         if st == "uniqueidentifier":
             return f"LOWER(CONVERT(varchar(36), {col}))"
         # ROWVERSION / BINARY: lossless '0x…' hex; identity preserved, NOT read as time.
+        # The inner CONVERT to varbinary(max) is load-bearing: FOR JSON serializes a
+        # rowversion-typed value as its raw bytes and silently ignores the style-1 hex
+        # request, so we first re-type it to plain varbinary, where style 1 produces the
+        # '0x…' hex text that round-trips. Without it the 8-byte counter leaks as raw
+        # bytes (a silent identity corruption the §8 gate must never allow).
         if st in _MS_BINARY:
-            return f"CONVERT(varchar(max), {col}, 1)"
+            return f"CONVERT(varchar(max), CONVERT(varbinary(max), {col}), 1)"
         # FLOAT / REAL: style 3 emits up to 17 significant digits (round-trippable).
         if st in _MS_FLOAT_WIDE or st in _MS_FLOAT_NARROW:
             return f"CONVERT(varchar(64), {col}, 3)"
@@ -382,7 +394,9 @@ class SqlServerDialect(SourceDialect):
         rows: list[dict[str, Any]] = []
         for line in out.splitlines():
             line = line.strip()
-            if line:
+            # Each row is one FOR JSON object → one line. Skip any header / separator /
+            # warning lines a sqlcmd flavour may interpose: a data line starts with '{'.
+            if line.startswith("{"):
                 rows.append(json.loads(line))
         return rows
 

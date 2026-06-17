@@ -26,6 +26,7 @@ from . import ontology as ont
 from . import mapper as mp
 from . import codegen as cg
 from . import reconcile as rc
+from . import dialect as dl
 
 REPO = Path(__file__).resolve().parent.parent
 
@@ -46,6 +47,10 @@ _TRAP = {
     ont.SEM_ARRAY_NUMERIC: ("VARCHAR(16777216)", mp.RC_EXACT_TEXT),
     ont.SEM_NETWORK: ("NUMBER(38,0)", mp.RC_EXACT_TEXT),  # inet→number = nonsense
     ont.SEM_AMBIGUOUS_TEXT: ("NUMBER(38,0)", mp.RC_EXACT_TEXT),  # exec error or loss
+    # ROWVERSION (SQL Server 'timestamp' synonym) lured into a temporal type — the
+    # checksum cannot catch it (binary bytes ≠ a parseable instant, so it execs-errors
+    # or mis-round-trips), and the structural guard must surface the misread chronology.
+    ont.SEM_BINARY: ("TIMESTAMP_NTZ", mp.RC_TS_WALL),
 }
 
 
@@ -136,13 +141,15 @@ def _frozen_integrity_enforced(frozen: dict[str, Any]) -> bool:
 
 
 def run_gate(profile_path: str | Path, manifest_path: str | Path,
-             *, clean_runs: int = 3, regen_iters: int = 5) -> tuple[GateResult, dict[str, Any]]:
+             *, clean_runs: int = 3, regen_iters: int = 5,
+             dialect: "dl.SourceDialect | None" = None) -> tuple[GateResult, dict[str, Any]]:
+    dialect = dialect or dl.DEFAULT_DIALECT
     profile = ont.load_profile(profile_path)
     manifest = json.loads(Path(manifest_path).read_text())
     hard = manifest["hard_columns"]
     hard_cols = {(h["table"], h["column"]) for h in hard}
 
-    onto = ont.lift(profile)
+    onto = ont.lift(profile, dialect=dialect)
     onto_problems = ont.validate(onto)
     maps = mp.map_ontology(onto)
     code = cg.generate(maps)
@@ -157,7 +164,7 @@ def run_gate(profile_path: str | Path, manifest_path: str | Path,
     consecutive = 0
     compile_errors = cg.compile_check(code)
     for i in range(clean_runs):
-        results = rc.run(code, maps, udt_index)
+        results = rc.run(code, maps, udt_index, dialect=dialect)
         clean, problems = _all_clean(results)
         ncols = sum(len(r.columns) for r in results)
         run_summaries.append({"run": i + 1, "clean": clean,
@@ -173,7 +180,8 @@ def run_gate(profile_path: str | Path, manifest_path: str | Path,
     }
 
     # ── Bullet 2: byte-identical SQL regeneration ───────────────────────────
-    digests = {_regen_digest(mp.map_ontology(ont.lift(profile))) for _ in range(regen_iters)}
+    digests = {_regen_digest(mp.map_ontology(ont.lift(profile, dialect=dialect)))
+               for _ in range(regen_iters)}
     gate.bullets["2_byte_identical_regen"] = {
         "pass": len(digests) == 1,
         "iterations": regen_iters,
@@ -251,7 +259,7 @@ def run_gate(profile_path: str | Path, manifest_path: str | Path,
     # ── Bullet 4: hard-fail detection (negative/ablation + semantic guard) ───
     naive = naive_mappings(maps, hard_cols)
     naive_code = cg.generate(naive)
-    naive_results = rc.run(naive_code, naive, udt_index)
+    naive_results = rc.run(naive_code, naive, udt_index, dialect=dialect)
     naive_index = {(m.entity, m.column): m for m in naive}
     caught = []
     for h in hard:
@@ -268,7 +276,7 @@ def run_gate(profile_path: str | Path, manifest_path: str | Path,
             cr = next((c for c in er.columns if c.column == key[1]), None)
             data_caught = bool(cr and not cr.match)
         # detector B: semantic guard (catches masked mismatches)
-        guard = rc.semantic_guard(p, nm)
+        guard = rc.semantic_guard(p, nm, dialect=dialect)
         guard_caught = bool(guard)
         caught.append({
             "column": f"{key[0]}.{key[1]}", "trapped": is_trap,
@@ -281,7 +289,7 @@ def run_gate(profile_path: str | Path, manifest_path: str | Path,
     # and the correct run is clean = nothing hidden).
     correct_guard_flags = []
     for m in maps:
-        g = rc.semantic_guard(prop_index[(m.entity, m.column)], m)
+        g = rc.semantic_guard(prop_index[(m.entity, m.column)], m, dialect=dialect)
         if g:
             correct_guard_flags.append({"column": f"{m.entity}.{m.column}", "flags": g})
     trapped = [c for c in caught if c["trapped"]]
@@ -317,20 +325,33 @@ def _target_compatible(got: str, expected: str) -> bool:
         if e_w is None:           # expected has no pinned width → any VARCHAR ok (enum)
             return True
         return g_w is not None and g_w.group(1) == e_w.group(1)
+    # TIMESTAMP_NTZ / TIMESTAMP_TZ family: base type must match; a pinned expected
+    # precision MUST match exactly (DATETIME2(7) mapped to NTZ(3) is a real defect), and
+    # an unpinned expected target accepts any precision (same discipline as VARCHAR).
+    for base in ("TIMESTAMP_NTZ", "TIMESTAMP_TZ"):
+        if e.startswith(base) and g.startswith(base):
+            e_p = re.search(r"\((\d+)\)", e)
+            g_p = re.search(r"\((\d+)\)", g)
+            if e_p is None:
+                return True
+            return g_p is not None and g_p.group(1) == e_p.group(1)
     return False
 
 
 # ── Readout ─────────────────────────────────────────────────────────────────
 
-def write_readout(gate: GateResult, out_path: str | Path) -> str:
+def write_readout(gate: GateResult, out_path: str | Path, *,
+                  issue: str = "SAU-305", source_label: str = "Postgres",
+                  target_label: str = "Snowflake",
+                  extra_caveats: list[str] | None = None) -> str:
     b = gate.bullets
     lines: list[str] = []
     A = lines.append
     verdict = "✅ GO" if gate.passed else "❌ NO-GO"
-    A(f"# SAU-305 §8 Exit-Gate Readout — {verdict}\n")
-    A("Phase 0 core loop: **lift → map → codegen → verification**. "
-      "Postgres → Snowflake, reconciled on a sample via a DuckDB execution proxy "
-      "(Snowflake SQL is compile-checked in the Snowflake dialect).\n")
+    A(f"# {issue} §8 Exit-Gate Readout — {verdict}\n")
+    A("Phase 0/1 core loop: **lift → map → codegen → verification**. "
+      f"{source_label} → {target_label}, reconciled on a sample via a DuckDB execution "
+      f"proxy ({target_label} SQL is compile-checked in the {target_label} dialect).\n")
     A("| # | Acceptance criterion | Result |")
     A("|---|----------------------|--------|")
 
@@ -431,6 +452,8 @@ def write_readout(gate: GateResult, out_path: str | Path) -> str:
     A("- **Inference pass is deterministic heuristic** here (reproducible, calibratable). "
       "The seam is LLM-pluggable; if an LLM is introduced it stays isolated to "
       "semantic-type inference only — never SQL generation (the reliability lever).")
+    for c in (extra_caveats or []):
+        A(f"- {c}")
 
     A("\n## Verdict\n")
     A(f"**{verdict}** for the §8 gate. "

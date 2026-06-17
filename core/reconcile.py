@@ -138,6 +138,13 @@ def _canon_exact(v: Any) -> str | None:
         return None
     if isinstance(v, Decimal):
         return format(v, "f")  # fixed-point, preserves scale, no sci-notation
+    if isinstance(v, (bytes, bytearray)):
+        # BINARY columns are landed in the proxy as their canonical '0x…' hex TEXT (the
+        # lossless wire form); DuckDB casting that text to BLOB keeps the literal hex
+        # characters, so decoding the bytes back to text recovers the exact source hex.
+        # The BINARY(N) *typing* is validated by the Snowflake compile gate, not here —
+        # the same documented proxy limitation as VARIANT/ARRAY (stored as JSON text).
+        return bytes(v).decode("latin-1")
     return str(v)
 
 
@@ -275,31 +282,44 @@ def reconcile_entity(ec: cg.EntityCode, mappings: list[mp.Mapping],
 # it, do not hide it."
 
 _NUMERIC_TARGET = ("NUMBER", "DECIMAL", "FLOAT", "INT", "DOUBLE")
+_TEMPORAL_TARGET = ("TIMESTAMP", "DATETIME", "DATE", "TIME")
 
 
-def semantic_guard(prop, m: mp.Mapping) -> list[str]:
-    """Structural red flags comparing source physical type ↔ chosen Snowflake target."""
-    flags: list[str] = []
-    src_dt = (prop.data_type or "").lower()
-    src_udt = (prop.udt or "").lower()
+def semantic_guard(prop, m: mp.Mapping,
+                   dialect: "dl.SourceDialect | None" = None) -> list[str]:
+    """Structural red flags comparing source physical type ↔ chosen Snowflake target.
+
+    Source-type recognition is delegated to the `dialect` (SAU-322): the guard branches
+    on the dialect's *canonical* `PT_*` token, never on raw source type strings, so a new
+    source lane (SQL Server, Oracle, …) inherits the guard for free instead of bolting on
+    a per-dialect string list. Defaults to Postgres so existing call sites are unchanged
+    — and the token table makes the Postgres branches byte-equivalent to the old strings.
+    """
+    dialect = dialect or dl.DEFAULT_DIALECT
+    tok = dialect.physical_token(prop.data_type or "", prop.udt or "")
     tgt = m.snowflake_type.upper()
     sem = m.semantic_type
+    flags: list[str] = []
 
     # tz-awareness must not change (no invented/dropped offset).
-    src_tz = "with time zone" in src_dt or src_udt == "timestamptz"
-    src_ntz = "without time zone" in src_dt or src_udt == "timestamp"
-    if src_ntz and ("_TZ" in tgt or tgt.endswith("TZ")) and "NTZ" not in tgt:
+    if tok == dl.PT_TIMESTAMP_NTZ and "TZ" in tgt and "NTZ" not in tgt:
         flags.append(
             "tz-awareness INVENTED: no-tz source mapped to a tz target — an offset "
             "would be fabricated and instants shifted"
         )
-    if src_tz and "NTZ" in tgt:
+    if tok == dl.PT_TIMESTAMP_TZ and "NTZ" in tgt:
         flags.append("tz DROPPED: tz-aware source mapped to a no-tz target")
 
+    # raw bytes / ROWVERSION must never be read as a temporal type (the SQL Server
+    # 'timestamp' synonym is a name trap: it is an 8-byte binary counter, not a time).
+    if tok == dl.PT_BINARY and tgt.startswith(_TEMPORAL_TARGET):
+        flags.append(
+            f"binary/row-version identity MISREAD as a temporal type ({tgt}): an "
+            "8-byte counter is not a timestamp — invented chronology, broken identity"
+        )
+
     # textual identity must not become numeric (leading zeros / formatting lost).
-    src_textual = src_dt in ("character", "char", "character varying", "varchar", "text") \
-        or src_udt in ("bpchar", "varchar", "text")
-    if src_textual and tgt.startswith(_NUMERIC_TARGET):
+    if tok in (dl.PT_TEXT, dl.PT_FIXED_CHAR) and tgt.startswith(_NUMERIC_TARGET):
         flags.append(
             f"textual identity COERCED to numeric ({tgt}): leading zeros / verbatim "
             f"format ({sem}) would be lost"

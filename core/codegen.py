@@ -19,6 +19,7 @@ Medallion layers:
 """
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -79,7 +80,15 @@ def _bronze_ddl(entity: str, mappings: list[mp.Mapping], dialect: str) -> str:
 
 def _transpile(sql: str, dialect: str) -> str:
     """Deterministic SQLGlot transpile from the canonical (Snowflake) form."""
-    return sqlglot.transpile(sql, read="snowflake", write=dialect, pretty=True)[0]
+    out = sqlglot.transpile(sql, read="snowflake", write=dialect, pretty=True)[0]
+    if dialect == "duckdb":
+        # DuckDB's BLOB takes no length parameter, so SQLGlot's faithful Snowflake
+        # BINARY(n) → BLOB(n) is a binder error in the execution proxy. The proxy lands
+        # BINARY as its canonical '0x…' hex TEXT (the width is irrelevant to execution
+        # and the BINARY(n) typing is asserted on the Snowflake side, which compiles);
+        # drop only the parameter so the proxy runs. Snowflake output is untouched.
+        out = re.sub(r"\bBLOB\(\d+\)", "BLOB", out)
+    return out
 
 
 def build_entity(entity: str, mappings: list[mp.Mapping]) -> EntityCode:

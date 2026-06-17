@@ -57,6 +57,16 @@ def _varchar(prop: ont.Property, default_len: int | None = None) -> str:
     return f"VARCHAR({n})" if n is not None else "VARCHAR"
 
 
+def _ts_type(base: str, prop: ont.Property) -> str:
+    """TIMESTAMP_NTZ/TZ qualified with the source fractional-second precision when the
+    profile carries it (SQL Server DATETIME2(7) → TIMESTAMP_NTZ(7), legacy DATETIME →
+    TIMESTAMP_NTZ(3)), so the target asserts the EXACT precision and a naive truncation
+    to a coarser scale is a visible type defect. Sources without a captured precision
+    (e.g. the Postgres lane) keep the unqualified type — unchanged behaviour."""
+    p = prop.datetime_precision
+    return f"{base}({p})" if p is not None else base
+
+
 def map_property(entity: str, prop: ont.Property) -> Mapping:
     """Map a single ontology property to its Snowflake target + reconcile strategy."""
     sem = prop.semantic_type
@@ -84,10 +94,10 @@ def map_property(entity: str, prop: ont.Property) -> Mapping:
     elif sem == ont.SEM_BOOLEAN:
         sf, rc = "BOOLEAN", RC_BOOLEAN
     elif sem == ont.SEM_TIMESTAMP_TZ:
-        sf, rc = "TIMESTAMP_TZ", RC_TS_INSTANT
+        sf, rc = _ts_type("TIMESTAMP_TZ", prop), RC_TS_INSTANT
         notes = "tz-aware — same UTC instant must round-trip"
     elif sem == ont.SEM_TIMESTAMP_NTZ:
-        sf, rc = "TIMESTAMP_NTZ", RC_TS_WALL
+        sf, rc = _ts_type("TIMESTAMP_NTZ", prop), RC_TS_WALL
         notes = "no time zone — wall-clock value preserved, no offset invented"
     elif sem == ont.SEM_DATE:
         sf, rc = "DATE", RC_EXACT_TEXT
