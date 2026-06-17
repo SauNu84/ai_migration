@@ -15,10 +15,14 @@ is the documented, secret-stored connection the loop uses (SAU-308 acceptance).
 
 ```bash
 cp .env.example .env && $EDITOR .env     # fill in real values (.env is gitignored)
-set -a; source .env; set +a              # export into the shell / run env
 pip install 'snowflake-connector-python>=3.12'   # optional live extra
-python3 scripts/verify_snowflake.py      # expect: CONNECTED + version/account/region
+python3 scripts/verify_snowflake.py      # expect: CONNECTED + LOOP-READY
 ```
+
+The probe **auto-loads the repo-root `.env`** (or `SNOWFLAKE_ENV_FILE=<path>`) for any
+vars not already exported — so dropping a filled-in `.env` at the repo root is the one
+canonical place to land credentials; no manual `source` step is needed. Real env vars
+always win over the file, so an injected secret store still takes precedence.
 
 ## Required settings
 

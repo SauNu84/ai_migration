@@ -1,7 +1,10 @@
 """SAU-308 — env-resolved Snowflake config: required vars, auth modes, no secret leak."""
+import os
+import tempfile
 import unittest
+from pathlib import Path
 
-from core.snowflake_conn import SnowflakeConfig, SnowflakeConfigError
+from core.snowflake_conn import SnowflakeConfig, SnowflakeConfigError, load_dotenv
 
 _BASE = {
     "SNOWFLAKE_ACCOUNT": "ab12345.eu-central-1",
@@ -47,6 +50,44 @@ class TestSnowflakeConfig(unittest.TestCase):
         self.assertNotIn("s3cr3t-value", repr(cfg))
         self.assertNotIn("s3cr3t-value", str(cfg.redacted()))
         self.assertEqual(cfg.redacted()["auth"], "password")
+
+
+class TestDotenvLoader(unittest.TestCase):
+    def setUp(self):
+        self._saved = {k: os.environ[k] for k in list(os.environ) if k.startswith("SNOWFLAKE_")}
+        for k in self._saved:
+            del os.environ[k]
+
+    def tearDown(self):
+        for k in [k for k in os.environ if k.startswith("SNOWFLAKE_")]:
+            del os.environ[k]
+        os.environ.update(self._saved)
+
+    def _write(self, text: str) -> str:
+        fd, path = tempfile.mkstemp(suffix=".env")
+        os.write(fd, text.encode()); os.close(fd)
+        self.addCleanup(lambda: Path(path).unlink(missing_ok=True))
+        return path
+
+    def test_loads_keys_and_strips_quotes_comments_export(self):
+        path = self._write(
+            "# comment\n\nexport SNOWFLAKE_ACCOUNT=\"ab12345.eu-central-1\"\n"
+            "SNOWFLAKE_USER='svc'\nSNOWFLAKE_PASSWORD=p@ss=word\n")
+        keys = load_dotenv(path)
+        self.assertEqual(set(keys),
+                         {"SNOWFLAKE_ACCOUNT", "SNOWFLAKE_USER", "SNOWFLAKE_PASSWORD"})
+        self.assertEqual(os.environ["SNOWFLAKE_ACCOUNT"], "ab12345.eu-central-1")
+        self.assertEqual(os.environ["SNOWFLAKE_USER"], "svc")
+        self.assertEqual(os.environ["SNOWFLAKE_PASSWORD"], "p@ss=word")  # value '=' kept
+
+    def test_real_env_wins_over_file(self):
+        os.environ["SNOWFLAKE_ACCOUNT"] = "from-env"
+        path = self._write("SNOWFLAKE_ACCOUNT=from-file\n")
+        load_dotenv(path)
+        self.assertEqual(os.environ["SNOWFLAKE_ACCOUNT"], "from-env")
+
+    def test_missing_file_is_noop(self):
+        self.assertEqual(load_dotenv("/no/such/file.env"), [])
 
 
 if __name__ == "__main__":

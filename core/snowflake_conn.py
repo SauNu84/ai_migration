@@ -26,10 +26,45 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 # Variables that carry a secret value — never echo these.
 _SECRET_VARS = ("SNOWFLAKE_PASSWORD", "SNOWFLAKE_PRIVATE_KEY_PASSPHRASE")
+
+# Canonical credential file: the repo-root `.env` (gitignored), overridable via
+# SNOWFLAKE_ENV_FILE. One unambiguous place to land credentials so the run can read
+# them without depending on adapter-specific env injection.
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+_DEFAULT_ENV_FILE = _REPO_ROOT / ".env"
+
+
+def load_dotenv(path: str | os.PathLike | None = None) -> list[str]:
+    """Populate os.environ from a KEY=VALUE file for any keys not already set.
+
+    Real-environment vars always win (a file never overrides an injected secret).
+    Stdlib-only, tolerant parser: blank lines and `#` comments skipped, optional
+    `export ` prefix and surrounding quotes stripped. Returns the SNOWFLAKE_* keys it
+    set (names only — never values). Missing file is a no-op.
+    """
+    p = Path(path) if path else Path(os.environ.get("SNOWFLAKE_ENV_FILE", _DEFAULT_ENV_FILE))
+    if not p.is_file():
+        return []
+    set_keys: list[str] = []
+    for raw in p.read_text().splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        if line.startswith("export "):
+            line = line[len("export "):]
+        key, _, value = line.partition("=")
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key and key not in os.environ:
+            os.environ[key] = value
+            if key.startswith("SNOWFLAKE_"):
+                set_keys.append(key)
+    return set_keys
 
 
 class SnowflakeConfigError(RuntimeError):
@@ -56,7 +91,12 @@ class SnowflakeConfig:
 
         Raises SnowflakeConfigError listing every missing required variable, so a
         misconfigured run fails loudly and actionably instead of half-connecting.
+
+        When reading the real environment (env is None), a gitignored `.env`
+        (or SNOWFLAKE_ENV_FILE) is loaded first for any keys not already set.
         """
+        if env is None:
+            load_dotenv()
         e = os.environ if env is None else env
 
         def val(name: str) -> str | None:
