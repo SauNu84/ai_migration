@@ -26,8 +26,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import subprocess
-import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -36,6 +34,7 @@ from typing import Any
 import duckdb
 
 from . import codegen as cg
+from . import dialect as dl
 from . import mapper as mp
 
 # float comparison tolerances by source physical width
@@ -43,53 +42,15 @@ _FLOAT4_SIG = 6      # REAL ~7 significant digits
 _FLOAT8_REL = 1e-12  # double precision relative tolerance
 
 
-# ── 1. Extraction (Postgres → lossless text wire form) ──────────────────────
+# ── 1. Extraction (source → lossless text wire form) ────────────────────────
+# The source read is a dialect seam (SAU-322): the per-column extraction expression and
+# the row read live in the SourceDialect. This wrapper preserves the original entry
+# point and defaults to Postgres so existing callers are unchanged.
 
-def _extract_expr(m: mp.Mapping) -> str:
-    """Per-column SQL expression producing a lossless text wire value.
-
-    Scalars → ::text (preserves numeric scale, leading zeros, tz offset). JSON/array
-    → canonical JSON text (array elements serialized as text to preserve scale)."""
-    col = f'"{m.column}"'
-    if m.reconcile == mp.RC_ARRAY_CANONICAL:
-        # JSON array of element TEXT, order-preserving; NULL array → JSON null.
-        return (
-            f"CASE WHEN {col} IS NULL THEN NULL ELSE "
-            f"(SELECT COALESCE(json_agg(e ORDER BY ord), '[]'::json)::text "
-            f" FROM unnest({col}) WITH ORDINALITY AS u(e, ord)) END"
-        )
-    if m.reconcile == mp.RC_JSON_CANONICAL:
-        return f"{col}::text"
-    return f"{col}::text"
-
-
-def extract_table(entity: str, mappings: list[mp.Mapping]) -> list[dict[str, Any]]:
-    """Extract a table from Postgres as a list of {column: text|None} rows, PK-ordered.
-
-    Uses psql (already on PATH for the SAU-303 harness) and emits one JSON object per
-    row, so values containing commas/unicode survive without delimiter games.
-    """
-    cols = sorted(mappings, key=lambda m: m.column)
-    pairs = ",\n      ".join(
-        f"'{m.column}', ({_extract_expr(m)})" for m in cols
-    )
-    has_id = any(m.column == "id" for m in cols)
-    order = 'ORDER BY "id"' if has_id else ""
-    sql = (
-        f"SELECT json_build_object(\n      {pairs}\n    )::text "
-        f'FROM "{entity}" {order}'
-    )
-    cmd = ["psql", "-X", "-tA", "-v", "ON_ERROR_STOP=1", "-c", sql]
-    proc = subprocess.run(cmd, capture_output=True, text=True)
-    if proc.returncode != 0:
-        sys.stderr.write(proc.stderr)
-        raise SystemExit(f"psql extract failed for {entity} (exit {proc.returncode})")
-    rows: list[dict[str, Any]] = []
-    for line in proc.stdout.splitlines():
-        line = line.strip()
-        if line:
-            rows.append(json.loads(line))
-    return rows
+def extract_table(entity: str, mappings: list[mp.Mapping],
+                  dialect: "dl.SourceDialect | None" = None) -> list[dict[str, Any]]:
+    """Extract a table from the source as a list of {column: text|None} rows, PK-ordered."""
+    return (dialect or dl.DEFAULT_DIALECT).extract_rows(entity, mappings)
 
 
 # ── 2. Execute medallion in DuckDB ──────────────────────────────────────────
@@ -130,34 +91,26 @@ def _canon_json(v: Any) -> str | None:
     return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
 
-def _canon_ts_instant(v: Any) -> str | None:
+def _canon_ts_instant(v: Any, fix_tz) -> str | None:
     if v is None:
         return None
     if isinstance(v, datetime):
         dt = v
     else:
         s = str(v).strip().replace(" ", "T", 1)
-        dt = datetime.fromisoformat(_fix_tz(s))
+        dt = datetime.fromisoformat(fix_tz(s))
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(timezone.utc).isoformat()
 
 
-def _canon_ts_wall(v: Any) -> str | None:
+def _canon_ts_wall(v: Any, fix_tz) -> str | None:
     if v is None:
         return None
     if isinstance(v, datetime):
         return v.replace(tzinfo=None).isoformat()
     s = str(v).strip().replace(" ", "T", 1)
-    return datetime.fromisoformat(_fix_tz(s)).replace(tzinfo=None).isoformat()
-
-
-def _fix_tz(s: str) -> str:
-    # Postgres emits '+00' / '+02'; fromisoformat wants '+00:00'.
-    for i in range(len(s) - 1, max(len(s) - 7, 0), -1):
-        if s[i] in "+-" and (len(s) - i) == 3:
-            return s + ":00"
-    return s
+    return datetime.fromisoformat(fix_tz(s)).replace(tzinfo=None).isoformat()
 
 
 def _canon_float(v: Any, sig: int) -> str | None:
@@ -188,18 +141,25 @@ def _canon_exact(v: Any) -> str | None:
     return str(v)
 
 
-def canonicalize(reconcile: str, v: Any, *, source_udt: str = "") -> str | None:
-    """Map a value to its canonical comparison string for the given strategy."""
+def canonicalize(reconcile: str, v: Any, *, source_udt: str = "",
+                 dialect: "dl.SourceDialect | None" = None) -> str | None:
+    """Map a value to its canonical comparison string for the given strategy.
+
+    The tz wire-format and narrow-float-width hooks are source-specific (SAU-322), so
+    they are delegated to the `dialect` (default Postgres); the comparison strategies
+    themselves are dialect-agnostic.
+    """
+    dialect = dialect or dl.DEFAULT_DIALECT
     if reconcile == mp.RC_JSON_CANONICAL or reconcile == mp.RC_ARRAY_CANONICAL:
         return _canon_json(v)
     if reconcile == mp.RC_TS_INSTANT:
-        return _canon_ts_instant(v)
+        return _canon_ts_instant(v, dialect.fix_tz)
     if reconcile == mp.RC_TS_WALL:
-        return _canon_ts_wall(v)
+        return _canon_ts_wall(v, dialect.fix_tz)
     if reconcile == mp.RC_BOOLEAN:
         return _canon_bool(v)
     if reconcile == mp.RC_APPROX_FLOAT:
-        sig = _FLOAT4_SIG if source_udt in ("float4", "real") else 12
+        sig = _FLOAT4_SIG if dialect.is_narrow_float(source_udt) else 12
         return _canon_float(v, sig)
     return _canon_exact(v)
 
@@ -244,7 +204,9 @@ def _checksum(values: list[str | None]) -> str:
 def reconcile_entity(ec: cg.EntityCode, mappings: list[mp.Mapping],
                      source_rows: list[dict[str, Any]],
                      target_rows: list[dict[str, Any]],
-                     udt_by_col: dict[str, str]) -> EntityResult:
+                     udt_by_col: dict[str, str],
+                     dialect: "dl.SourceDialect | None" = None) -> EntityResult:
+    dialect = dialect or dl.DEFAULT_DIALECT
     cols = sorted(mappings, key=lambda m: m.column)
     col_results: list[ColumnResult] = []
     n = min(len(source_rows), len(target_rows))
@@ -252,9 +214,9 @@ def reconcile_entity(ec: cg.EntityCode, mappings: list[mp.Mapping],
 
     for m in cols:
         udt = udt_by_col.get(m.column, "")
-        src_canon = [canonicalize(m.reconcile, r.get(m.column), source_udt=udt)
+        src_canon = [canonicalize(m.reconcile, r.get(m.column), source_udt=udt, dialect=dialect)
                      for r in source_rows]
-        tgt_canon = [canonicalize(m.reconcile, r.get(m.column), source_udt=udt)
+        tgt_canon = [canonicalize(m.reconcile, r.get(m.column), source_udt=udt, dialect=dialect)
                      for r in target_rows]
         scs, tcs = _checksum(src_canon), _checksum(tgt_canon)
         mismatches: list[dict[str, Any]] = []
@@ -370,8 +332,10 @@ def semantic_guard(prop, m: mp.Mapping) -> list[str]:
 
 
 def run(code: dict[str, cg.EntityCode], mappings: list[mp.Mapping],
-        udt_index: dict[tuple[str, str], str]) -> list[EntityResult]:
+        udt_index: dict[tuple[str, str], str],
+        dialect: "dl.SourceDialect | None" = None) -> list[EntityResult]:
     """Full verification run across all entities. Fresh DuckDB per run (isolation)."""
+    dialect = dialect or dl.DEFAULT_DIALECT
     by_entity: dict[str, list[mp.Mapping]] = {}
     for m in mappings:
         by_entity.setdefault(m.entity, []).append(m)
@@ -382,7 +346,7 @@ def run(code: dict[str, cg.EntityCode], mappings: list[mp.Mapping],
     try:
         for entity, ec in code.items():
             ms = by_entity[entity]
-            src = extract_table(entity, ms)
+            src = extract_table(entity, ms, dialect)
             try:
                 run_medallion(con, ec, src)
                 tgt = read_gold(con, entity, ec.text_columns)
@@ -394,7 +358,7 @@ def run(code: dict[str, cg.EntityCode], mappings: list[mp.Mapping],
                 ))
                 continue
             udt_by_col = {c: udt_index.get((entity, c), "") for c in ec.text_columns}
-            results.append(reconcile_entity(ec, ms, src, tgt, udt_by_col))
+            results.append(reconcile_entity(ec, ms, src, tgt, udt_by_col, dialect))
     finally:
         con.close()
     return results

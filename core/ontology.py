@@ -28,6 +28,8 @@ from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Any
 
+from . import dialect as dl
+
 ONTOLOGY_SCHEMA_VERSION = "0.1.0"
 
 # Envelope version for the frozen approved-ontology artifact (SAU-312).
@@ -200,10 +202,6 @@ _LEGACY_TEXT_NAME = re.compile(r"legacy|_text$|_str$|raw_", re.I)
 _NUMERIC_LOOKING = re.compile(r"^\s*-?[\d.,]+\s*$")
 
 
-def _is_array(udt: str, data_type: str) -> bool:
-    return data_type.upper() == "ARRAY" or udt.startswith("_")
-
-
 def _looks_numeric_text(min_v: str | None, max_v: str | None) -> bool:
     """True only if BOTH observed bounds look numeric AND at least one carries an
     ambiguity (comma-decimal or leading characters) that makes auto-parsing unsafe."""
@@ -228,7 +226,9 @@ def _has_leading_zero(*vals: str | None) -> bool:
 
 
 def infer_property(col: dict[str, Any], *, is_pk: bool, is_fk: bool,
-                   enum_udts: set[str]) -> tuple[str, float, list[str], list[str]]:
+                   enum_udts: set[str],
+                   dialect: "dl.SourceDialect | None" = None,
+                   ) -> tuple[str, float, list[str], list[str]]:
     """Infer (semantic_type, confidence, governance_tags, signals) for one column.
 
     Confidence is *calibrated to risk*: a type whose mapping is unambiguous given
@@ -238,9 +238,14 @@ def infer_property(col: dict[str, Any], *, is_pk: bool, is_fk: bool,
 
     This is THE inference seam. The call is counted so a frozen-ontology regeneration
     can prove it was never re-entered (SAU-312); an LLM classifier would plug in here.
+
+    Physical-type recognition is delegated to the source `dialect` (SAU-322): the
+    function branches on the dialect's *canonical* `PT_*` token, never on raw source
+    type strings, so a new source lane supplies a token table instead of editing here.
     """
     global _INFERENCE_CALLS
     _INFERENCE_CALLS += 1
+    dialect = dialect or dl.DEFAULT_DIALECT
     name = col["name"]
     dt = (col.get("data_type") or "").lower()
     udt = (col.get("udt") or "").lower()
@@ -264,40 +269,42 @@ def infer_property(col: dict[str, Any], *, is_pk: bool, is_fk: bool,
         sig.append(f"pg_enum_type:{udt}")
         return SEM_ENUM, 0.85, tags, sig
 
+    # Canonical physical-type token (dialect-owned recognition).
+    ptok = dialect.physical_token(dt, udt)
+
     # Arrays.
-    if _is_array(udt, dt):
-        # numeric element type? udt like _numeric / _int8 etc.
-        if any(k in udt for k in ("numeric", "int", "float", "numer")):
-            sig.append(f"array_of_numeric:{udt}")
-            return SEM_ARRAY_NUMERIC, 0.8, tags, sig
+    if ptok == dl.PT_ARRAY_NUMERIC:
+        sig.append(f"array_of_numeric:{udt}")
+        return SEM_ARRAY_NUMERIC, 0.8, tags, sig
+    if ptok == dl.PT_ARRAY:
         sig.append(f"array_type:{udt}")
         return SEM_ARRAY, 0.85, tags, sig
 
     # Semi-structured.
-    if dt in ("jsonb", "json") or udt in ("jsonb", "json"):
+    if ptok == dl.PT_JSON:
         sig.append("json_type")
         return SEM_SEMI_STRUCTURED, 0.85, tags, sig
 
     # Network.
-    if udt in ("inet", "cidr") or dt in ("inet", "cidr"):
+    if ptok == dl.PT_NETWORK:
         sig.append("inet_no_native_target")
         return SEM_NETWORK, 0.85, tags, sig
 
     # Timestamps — the tz distinction is decided purely by the physical type.
-    if "timestamp with time zone" in dt or udt == "timestamptz":
+    if ptok == dl.PT_TIMESTAMP_TZ:
         sig.append("timestamptz_physical_type")
         return SEM_TIMESTAMP_TZ, 0.9, tags, sig
-    if "timestamp without time zone" in dt or udt == "timestamp":
+    if ptok == dl.PT_TIMESTAMP_NTZ:
         sig.append("timestamp_ntz_physical_type")
         return SEM_TIMESTAMP_NTZ, 0.9, tags, sig
-    if dt == "date":
+    if ptok == dl.PT_DATE:
         return SEM_DATE, 0.95, tags, sig
 
-    if dt == "boolean" or udt == "bool":
+    if ptok == dl.PT_BOOLEAN:
         return SEM_BOOLEAN, 0.97, tags, sig
 
     # Fixed-width identifiers / PII (char(N)) — leading-zero corroboration.
-    if dt in ("character", "char") or udt == "bpchar":
+    if ptok == dl.PT_FIXED_CHAR:
         lead = _has_leading_zero(mn, mx)
         if _FIXED_PII_NAME.search(name):
             tags.append("PII")
@@ -315,14 +322,14 @@ def infer_property(col: dict[str, Any], *, is_pk: bool, is_fk: bool,
         return SEM_FREE_TEXT, 0.8, tags, sig
 
     # Floats — explicitly lossy.
-    if dt in ("real", "double precision") or udt in ("float4", "float8"):
+    if ptok in (dl.PT_FLOAT, dl.PT_FLOAT_NARROW):
         sig.append(f"float_physical_type:{udt}")
-        # REAL (float4) is lossier than double → lower confidence.
-        conf = 0.7 if udt == "float4" or dt == "real" else 0.75
+        # narrow (float4 / REAL) is lossier than double → lower confidence.
+        conf = 0.7 if ptok == dl.PT_FLOAT_NARROW else 0.75
         return SEM_LOSSY_FLOAT, conf, tags, sig
 
     # Exact numerics.
-    if dt == "numeric" or udt in ("numeric",):
+    if ptok == dl.PT_NUMERIC:
         # An explicit numeric(p,s) mechanically pins the target NUMBER(p,s): no
         # judgment needed, so confidence is high. The residual uncertainty is the
         # currency-scale-vs-currency-code subtlety (e.g. JPY stored at 2dp).
@@ -337,7 +344,7 @@ def infer_property(col: dict[str, Any], *, is_pk: bool, is_fk: bool,
         return SEM_CURRENCY_DECIMAL if (scale or 0) > 0 else SEM_INTEGER, 0.82, tags, sig
 
     # Integers — money-as-cents is the trap.
-    if dt in ("bigint", "integer", "smallint") or udt in ("int8", "int4", "int2"):
+    if ptok == dl.PT_INTEGER:
         if _CENTS_NAME.search(name):
             tags.append("currency")
             sig.append("integer_cents_name")
@@ -348,7 +355,7 @@ def infer_property(col: dict[str, Any], *, is_pk: bool, is_fk: bool,
         return SEM_INTEGER, 0.95, tags, sig
 
     # Text columns — PII names, ambiguous numeric-looking text, or free text.
-    if dt in ("character varying", "varchar", "text") or udt in ("varchar", "text"):
+    if ptok == dl.PT_TEXT:
         if _EMAIL_NAME.search(name):
             tags.append("PII")
             sig.append("email_name")
@@ -378,8 +385,13 @@ def infer_property(col: dict[str, Any], *, is_pk: bool, is_fk: bool,
     return SEM_FREE_TEXT, 0.5, tags, sig
 
 
-def lift(profile: dict[str, Any]) -> Ontology:
-    """Lift a SAU-303 profile artifact into the typed property-graph ontology."""
+def lift(profile: dict[str, Any], dialect: "dl.SourceDialect | None" = None) -> Ontology:
+    """Lift a SAU-303 profile artifact into the typed property-graph ontology.
+
+    `dialect` (SAU-322) supplies the source-specific physical-type recognition; it
+    defaults to Postgres so existing call sites are unchanged.
+    """
+    dialect = dialect or dl.DEFAULT_DIALECT
     fks = profile.get("foreign_keys", [])
     # index FK membership per (table, column) for the inference pass
     fk_cols: set[tuple[str, str]] = set()
@@ -405,11 +417,11 @@ def lift(profile: dict[str, Any]) -> Ontology:
             )
         )
 
-    # enum udts: any column whose udt is not a known builtin and data_type is USER-DEFINED
+    # enum udts: any column whose data_type denotes a user-defined (enum) domain.
     enum_udts: set[str] = set()
     for t in profile.get("tables", []):
         for c in t.get("columns", []):
-            if (c.get("data_type") or "").upper() == "USER-DEFINED":
+            if dialect.is_user_defined(c.get("data_type") or ""):
                 enum_udts.add((c.get("udt") or "").lower())
 
     entities: list[Entity] = []
@@ -422,7 +434,7 @@ def lift(profile: dict[str, Any]) -> Ontology:
             is_pk = cname == "id" and (c.get("data_type") in ("bigint", "integer"))
             is_fk = (tname, cname) in fk_cols
             sem, conf, tags, sig = infer_property(
-                c, is_pk=is_pk, is_fk=is_fk, enum_udts=enum_udts
+                c, is_pk=is_pk, is_fk=is_fk, enum_udts=enum_udts, dialect=dialect
             )
             props.append(
                 Property(

@@ -6,7 +6,11 @@ artifacts/sql/
 __pycache__/
 *.pyc
 .venv/
+.venv-*/
 venv/
+
+# Orchestration scratch
+.orch-tmp/
 
 # Env / secrets — never commit
 .env

@@ -17,4 +17,4 @@ then SQLGlot transpiles it deterministically. The LLM is never asked to be a
 multi-dialect SQL expert — it is isolated to semantic-type inference only.
 """
 
-__all__ = ["ontology", "mapper", "codegen", "reconcile", "gate"]
+__all__ = ["dialect", "ontology", "mapper", "codegen", "reconcile", "gate"]

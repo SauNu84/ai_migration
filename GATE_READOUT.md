@@ -6,6 +6,7 @@ Phase 0 core loop: **lift → map → codegen → verification**. Postgres → S
 |---|----------------------|--------|
 | 1 | 100% row-count + checksum on Gold, 3/3 clean runs | ✅ PASS — 3/3 consecutive clean; Snowflake compile errors: 0 |
 | 2 | Byte-identical SQL regeneration (SQLGlot) | ✅ PASS — 5 regenerations, 1 distinct digest(s) |
+| 2b | Byte-identical regen from FROZEN ontology (no re-inference) | ✅ PASS — 5 regens, 1 digest(s), matches live: True, inference re-entered: False |
 | 3 | Calibrated confidence vs hard-column manifest | ✅ PASS — 20/20 targets correct, 20/20 meet confidence floor |
 | 4 | Hard-fail: surface silent loss / coercion / masked mismatch | ✅ PASS — 15/15 injected traps caught, 0 false alarms |
 | 5 | Written readout for CTO go/no-go | ✅ this document |
@@ -20,6 +21,14 @@ Phase 0 core loop: **lift → map → codegen → verification**. Postgres → S
 
 - canonical SQL generated once per ontology; SQLGlot deterministic transpile (no LLM redraft)
 - SHA-256 over all Snowflake DDL/DML across 5 regenerations: `fb6dc1f0ef7fdf1688c4fe13b21b2e977612931d535b4615b6f41918f12e5dd6`
+
+### 2b · Frozen-ontology regeneration (SAU-312 / CTO item ②)
+
+- Bullet 2 above re-lifts from the profile, which is byte-identical only because inference is a deterministic heuristic today. The real guarantee is this: the **approved ontology is frozen to a content-addressed artifact**, and regeneration loads that artifact and re-maps + re-codegens — the inference seam is never re-entered. The guarantee therefore survives an LLM entering inference.
+- Frozen-artifact SHA-256: `a09cd3f34ad3607a1525139f614693ce01043623ba26b54d7180801889748ca6`
+- 5 regenerations from the frozen artifact → 1 distinct digest(s); matches the live generation: True.
+- Inference re-entered on the regen path: **False** (enforced by `assert_no_inference`).
+- Tampered-frozen-artifact rejected by integrity check: True.
 
 ## 3 · Confidence calibration (hard columns)
 
