@@ -30,21 +30,35 @@ from core import dialect as dl  # noqa: E402
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Phase 0 source profiler")
-    ap.add_argument("--schema", default="public")
+    ap.add_argument("--source", choices=("postgres", "sqlserver"), default="postgres",
+                    help="source dialect lane (SAU-322 seam)")
+    ap.add_argument("--schema", default=None,
+                    help="schema to profile (default: 'public' for postgres, 'dbo' for sqlserver)")
     ap.add_argument("--out", default=str(REPO_ROOT / "artifacts" / "profile.json"))
     args = ap.parse_args()
 
-    # Profiler-SQL template + invocation are a dialect seam; default lane is Postgres.
-    source: dl.PostgresDialect = dl.PostgresDialect()
-    raw = source.run_profiler(args.schema)
+    # Profiler-SQL template + invocation are a dialect seam (SAU-322).
+    if args.source == "sqlserver":
+        source: dl.SourceDialect = dl.SqlServerDialect()
+        schema = args.schema or "dbo"
+        raw = source.run_profiler(schema)
+        src_meta = {
+            "host": os.environ.get("MSSQL_HOST", "localhost"),
+            "port": os.environ.get("MSSQL_HOST_PORT", "14333"),
+        }
+    else:
+        source = dl.PostgresDialect()
+        schema = args.schema or "public"
+        raw = source.run_profiler(schema)
+        src_meta = {
+            "host": os.environ.get("PGHOST", "localhost"),
+            "port": os.environ.get("PGPORT", "5432"),
+        }
 
     profile = json.loads(raw)
     profile["generated_at"] = datetime.now(timezone.utc).isoformat()
-    profile["source"] = {
-        "host": os.environ.get("PGHOST", "localhost"),
-        "port": os.environ.get("PGPORT", "5432"),
-        "database": profile.get("database"),
-    }
+    profile["dialect"] = source.name
+    profile["source"] = {**src_meta, "database": profile.get("database")}
 
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)

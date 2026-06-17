@@ -91,6 +91,12 @@ def map_property(entity: str, prop: ont.Property) -> Mapping:
         notes = "no time zone — wall-clock value preserved, no offset invented"
     elif sem == ont.SEM_DATE:
         sf, rc = "DATE", RC_EXACT_TEXT
+    elif sem == ont.SEM_BINARY:
+        # ROWVERSION / raw bytes — fixed-width BINARY identity, reconciled as exact hex
+        # text. Never a timestamp (the legacy 'timestamp' synonym is the trap).
+        n = prop.char_max_len if prop.char_max_len else 8
+        sf, rc = f"BINARY({n})", RC_EXACT_TEXT
+        notes = "row-version/binary identity preserved as BINARY — not interpreted as time"
     elif sem in (ont.SEM_PII_FIXED_WIDTH, ont.SEM_FIXED_WIDTH_ID):
         sf, rc = _varchar(prop), RC_EXACT_TEXT
         notes = "fixed-width identity — must stay textual; numeric coercion drops leading zeros"

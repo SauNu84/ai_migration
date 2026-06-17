@@ -97,6 +97,7 @@ SEM_AMBIGUOUS_TEXT = "ambiguous_text_numeric"
 SEM_LOSSY_FLOAT = "lossy_float"
 SEM_BOOLEAN = "boolean"
 SEM_INTEGER = "integer"
+SEM_BINARY = "binary"                 # raw bytes / row-version — preserved as BINARY, never time
 SEM_FREE_TEXT = "free_text"
 
 PII_SEMANTICS = {
@@ -256,21 +257,29 @@ def infer_property(col: dict[str, Any], *, is_pk: bool, is_fk: bool,
     tags: list[str] = []
     sig: list[str] = []
 
+    # Canonical physical-type token (dialect-owned recognition). Computed up-front so the
+    # structural FK shortcut below can stay type-aware (the keys-first certainty must not
+    # blindly coerce a non-integer foreign key to a numeric surrogate key).
+    ptok = dialect.physical_token(dt, udt)
+
     # Keys first — structural certainty.
     if is_pk:
         sig.append("primary_key_constraint")
         return SEM_PK, 0.99, tags, sig
-    if is_fk:
+    # An integer FK is a numeric surrogate key → NUMBER. A non-integer FK (e.g. a GUID
+    # foreign key in the SQL Server lane) must NOT be coerced to NUMBER, which would
+    # corrupt its textual identity and break joins — it falls through to physical-type
+    # inference so it is preserved (e.g. uniqueidentifier → VARCHAR(36)).
+    if is_fk and ptok == dl.PT_INTEGER:
         sig.append("foreign_key_constraint")
         return SEM_FK, 0.97, tags, sig
+    if is_fk:
+        sig.append("foreign_key_constraint")
 
     # Enums (no native Snowflake type — judgment call → moderate confidence).
     if udt in enum_udts:
         sig.append(f"pg_enum_type:{udt}")
         return SEM_ENUM, 0.85, tags, sig
-
-    # Canonical physical-type token (dialect-owned recognition).
-    ptok = dialect.physical_token(dt, udt)
 
     # Arrays.
     if ptok == dl.PT_ARRAY_NUMERIC:
@@ -328,6 +337,13 @@ def infer_property(col: dict[str, Any], *, is_pk: bool, is_fk: bool,
         conf = 0.7 if ptok == dl.PT_FLOAT_NARROW else 0.75
         return SEM_LOSSY_FLOAT, conf, tags, sig
 
+    # MONEY / SMALLMONEY — the physical type itself pins fixed scale-4 currency, so no
+    # name heuristic is needed: an unambiguous exact-decimal mapping (high confidence).
+    # The 4th-dp survival is enforced in the extraction wire form (SqlServerDialect).
+    if ptok == dl.PT_MONEY:
+        sig.append("money_type_fixed_scale4")
+        return SEM_CURRENCY_DECIMAL, 0.98, tags, sig
+
     # Exact numerics.
     if ptok == dl.PT_NUMERIC:
         # An explicit numeric(p,s) mechanically pins the target NUMBER(p,s): no
@@ -368,9 +384,11 @@ def infer_property(col: dict[str, Any], *, is_pk: bool, is_fk: bool,
             # heuristic: "full_name" yes; "metric_name"/"tz_name" no
             pass
         if name in ("full_name", "first_name", "last_name"):
+            # An exact person-name column is unambiguous PII text → high confidence
+            # (the gate is the exact name, so there is no judgment call to discount).
             tags.append("PII")
             sig.append("person_name")
-            return SEM_PII_NAME, 0.85, tags, sig
+            return SEM_PII_NAME, 0.9, tags, sig
         # Numeric-looking legacy text → ambiguous, must NOT auto-parse → low conf.
         if _LEGACY_TEXT_NAME.search(name) and _looks_numeric_text(mn, mx):
             sig.append("numeric_looking_text+legacy_name")
@@ -379,6 +397,12 @@ def infer_property(col: dict[str, Any], *, is_pk: bool, is_fk: bool,
             sig.append("numeric_looking_text")
             return SEM_AMBIGUOUS_TEXT, 0.75, tags, sig
         return SEM_FREE_TEXT, 0.9, tags, sig
+
+    # Raw bytes / ROWVERSION — preserved as BINARY identity, never interpreted as time
+    # (the 'timestamp' synonym is a name trap the §8 gate exists to catch).
+    if ptok == dl.PT_BINARY:
+        sig.append("binary_identity_not_timestamp")
+        return SEM_BINARY, 0.9, tags, sig
 
     # Fallback — unknown physical type → low confidence, surface for review.
     sig.append(f"unrecognized_type:{dt}/{udt}")
