@@ -1,0 +1,147 @@
+{
+  "$schema_note": "Ground truth for the §8 calibration check on the SQL Server lane (SAU-323), the analogue of ground_truth/hard_columns.json (Postgres / SAU-303). Each entry is a deliberately hard column: the source SQL Server (T-SQL) type, the EXPECTED-correct Snowflake target representation, the trap a naive mapper falls into, the verification assertion the core loop must satisfy, and the §8 detector expected to catch a naive mapping. 'confidence_floor' is the minimum calibrated confidence the mapper should report when it gets this right. 'detection' is the expected-catch: 'checksum' = data reconciliation (row-count + per-column checksum on Gold), 'semantic_guard' = the structural type-semantics guard (fires even when sample data coincidentally round-trips).",
+  "version": "0.1.0",
+  "dialect": { "source": "sqlserver", "target": "snowflake" },
+  "hard_columns": [
+    {
+      "table": "policyholder", "column": "ssn_last4",
+      "tsql_type": "char(4)", "snowflake_target": "VARCHAR(4)",
+      "trap": "fixed-width PII with leading zeros ('0042','0007') — must NOT be coerced to NUMBER, which drops leading zeros and changes identity",
+      "category": "pii_fixed_width", "assert": "byte-identical string preserved incl. leading zeros",
+      "detection": ["checksum", "semantic_guard"], "confidence_floor": 0.95
+    },
+    {
+      "table": "payment_method", "column": "card_last4",
+      "tsql_type": "char(4)", "snowflake_target": "VARCHAR(4)",
+      "trap": "leading-zero last4 ('0019') — numeric coercion is lossy",
+      "category": "pii_fixed_width", "assert": "string preserved",
+      "detection": ["checksum", "semantic_guard"], "confidence_floor": 0.95
+    },
+    {
+      "table": "document", "column": "file_hash",
+      "tsql_type": "char(64)", "snowflake_target": "VARCHAR(64)",
+      "trap": "fixed-width sha-256 hex with leading zeros — must stay textual identity, not parsed as a (huge) number",
+      "category": "fixed_width_identifier", "assert": "string preserved",
+      "detection": ["checksum", "semantic_guard"], "confidence_floor": 0.95
+    },
+    {
+      "table": "policy", "column": "premium",
+      "tsql_type": "money", "snowflake_target": "NUMBER(19,4)",
+      "trap": "MONEY is fixed scale-4 (922337203685477.5807 range). Default CONVERT(varchar, money) emits only 2 dp, and FLOAT/NUMBER(_,2) mapping silently drops the 4th dp — corrupting 999999.9999 and 0.0001",
+      "category": "money_precision", "assert": "exact decimal, scale 4 preserved at the 4th dp and at the high-precision boundary",
+      "detection": ["checksum", "semantic_guard"], "confidence_floor": 0.98
+    },
+    {
+      "table": "claim_payment", "column": "fee",
+      "tsql_type": "smallmoney", "snowflake_target": "NUMBER(10,4)",
+      "trap": "SMALLMONEY is also scale-4 (range +/-214748.3647); naive 2-dp mapping drops the 4th dp (0.0001)",
+      "category": "money_precision", "assert": "scale 4 preserved; small-range still 4-dp",
+      "detection": ["checksum", "semantic_guard"], "confidence_floor": 0.95
+    },
+    {
+      "table": "journal_line", "column": "debit",
+      "tsql_type": "money", "snowflake_target": "NUMBER(19,4)",
+      "trap": "GL MONEY amount — must remain exact NUMBER(19,4); FLOAT mapping loses the sub-cent plug (0.0001)",
+      "category": "money_precision", "assert": "exact integer-of-pennies preserved; never FLOAT",
+      "detection": ["checksum", "semantic_guard"], "confidence_floor": 0.95
+    },
+    {
+      "table": "claim", "column": "reserve_amount",
+      "tsql_type": "float", "snowflake_target": "FLOAT",
+      "trap": "currency-as-FLOAT: a reserve held in FLOAT(53) cannot represent 4-dp money exactly (499999.9999999). FLOAT->FLOAT is acceptable but the mapper must FLAG lossy float identity (not assert byte/scale equality) and surface the currency-in-float smell",
+      "category": "currency_as_float", "assert": "approximate-equality within float8 epsilon; flagged lossy, never asserted exact-scale currency",
+      "detection": ["semantic_guard"], "confidence_floor": 0.7
+    },
+    {
+      "table": "journal_entry", "column": "entered_at",
+      "tsql_type": "datetime", "snowflake_target": "TIMESTAMP_NTZ(3)",
+      "trap": "legacy DATETIME rounds to ~3.33 ms ticks (1/300 s): '...:00.123' stores as '...:00.123333', '...:59.997' is a boundary. Mapping to TIMESTAMP_NTZ(7)/DATETIME2 invents precision; mapping to TIMESTAMP_TZ invents an offset",
+      "category": "datetime_legacy_precision", "assert": "wall-clock value preserved at the DATETIME tick the engine actually stored; no tz applied",
+      "detection": ["checksum", "semantic_guard"], "confidence_floor": 0.85
+    },
+    {
+      "table": "journal_entry", "column": "posted_at",
+      "tsql_type": "datetime2(7)", "snowflake_target": "TIMESTAMP_NTZ(7)",
+      "trap": "DATETIME2(7) holds 100-ns precision ('...:59.9999999'). Mapping to TIMESTAMP_NTZ(3) / legacy DATETIME truncates the sub-microsecond digits",
+      "category": "datetime2_precision", "assert": "all 7 fractional digits preserved; no truncation to ms",
+      "detection": ["checksum", "semantic_guard"], "confidence_floor": 0.9
+    },
+    {
+      "table": "policy", "column": "effective_at",
+      "tsql_type": "datetimeoffset(7)", "snowflake_target": "TIMESTAMP_TZ",
+      "trap": "tz-aware (+00,+02,+09); dropping the offset (-> TIMESTAMP_NTZ) or flipping it shifts the instant",
+      "category": "timestamp_tz", "assert": "same UTC instant + offset preserved",
+      "detection": ["checksum", "semantic_guard"], "confidence_floor": 0.9
+    },
+    {
+      "table": "company", "column": "created_at",
+      "tsql_type": "datetimeoffset(7)", "snowflake_target": "TIMESTAMP_TZ",
+      "trap": "tz-aware; offsets (+00,+02,+09) must round-trip to the same instant, not a naive wall-clock NTZ",
+      "category": "timestamp_tz", "assert": "same UTC instant preserved across offsets",
+      "detection": ["checksum", "semantic_guard"], "confidence_floor": 0.9
+    },
+    {
+      "table": "company", "column": "id",
+      "tsql_type": "uniqueidentifier", "snowflake_target": "VARCHAR(36)",
+      "trap": "GUID has no Snowflake native type; must serialize to canonical 36-char text. Coercing to BINARY/number, re-casing, or adding braces breaks join identity against FKs",
+      "category": "uniqueidentifier", "assert": "canonical lowercase 8-4-4-4-12 text preserved; FK joins intact",
+      "detection": ["checksum", "semantic_guard"], "confidence_floor": 0.9
+    },
+    {
+      "table": "transaction_ledger", "column": "exchange_rate",
+      "tsql_type": "decimal(18,8)", "snowflake_target": "NUMBER(18,8)",
+      "trap": "8-dp FX rate (1.08734500, 0.00667125) — FLOAT rounding corrupts the 8th place; scale must be kept",
+      "category": "rate_precision", "assert": "scale 8 preserved exactly",
+      "detection": ["checksum", "semantic_guard"], "confidence_floor": 0.95
+    },
+    {
+      "table": "coverage", "column": "limit_amount",
+      "tsql_type": "decimal(18,2)", "snowflake_target": "NUMBER(18,2)",
+      "trap": "currency limit (10000000.00) — FLOAT mapping loses exactness; scale-2 must hold",
+      "category": "currency_precision", "assert": "scale 2 preserved at large magnitude",
+      "detection": ["checksum", "semantic_guard"], "confidence_floor": 0.95
+    },
+    {
+      "table": "audit_trail", "column": "row_version",
+      "tsql_type": "rowversion", "snowflake_target": "BINARY(8)",
+      "trap": "ROWVERSION (a.k.a. legacy synonym 'timestamp') is an auto 8-byte binary counter, NOT a datetime. The name lures a naive mapper into TIMESTAMP_*; it must map to BINARY(8) / hex text",
+      "category": "rowversion", "assert": "8-byte binary value preserved; NOT interpreted as a timestamp",
+      "detection": ["semantic_guard"], "confidence_floor": 0.9
+    },
+    {
+      "table": "audit_trail", "column": "ip_address",
+      "tsql_type": "varchar(45)", "snowflake_target": "VARCHAR(45)",
+      "trap": "IPv4 + IPv6 ('::1','2001:db8::8a2e:370:7334') stored as text; no native inet type — must serialize losslessly, not be reparsed/normalized",
+      "category": "no_native_target", "assert": "canonical text form preserved (IPv4 + IPv6)",
+      "detection": ["checksum"], "confidence_floor": 0.85
+    },
+    {
+      "table": "product_catalog", "column": "attributes_json",
+      "tsql_type": "nvarchar(max) (ISJSON)", "snowflake_target": "VARIANT",
+      "trap": "JSON-in-NVARCHAR — flattening to VARCHAR loses structure/queryability; must PARSE_JSON into VARIANT",
+      "category": "semi_structured", "assert": "round-trips as parseable VARIANT, nested keys intact",
+      "detection": ["semantic_guard"], "confidence_floor": 0.85
+    },
+    {
+      "table": "claim", "column": "metadata_json",
+      "tsql_type": "nvarchar(max) (ISJSON)", "snowflake_target": "VARIANT",
+      "trap": "JSON with unicode + emoji ('🔥', 'Küche', 'テスト') — encoding must survive PARSE_JSON into VARIANT",
+      "category": "semi_structured", "assert": "unicode/emoji preserved in VARIANT",
+      "detection": ["semantic_guard"], "confidence_floor": 0.85
+    },
+    {
+      "table": "policyholder", "column": "full_name",
+      "tsql_type": "nvarchar(200)", "snowflake_target": "VARCHAR(200)",
+      "trap": "NVARCHAR unicode (CJK '田中 太郎', diacritics 'Müller') — mapping through a non-unicode VARCHAR/codepage or a CS-vs-CI collation mismatch corrupts characters; governance-tag as PII",
+      "category": "unicode_text", "assert": "full unicode value preserved byte-for-byte (NFC); PII tagged",
+      "detection": ["checksum", "semantic_guard"], "confidence_floor": 0.9
+    },
+    {
+      "table": "policy", "column": "legacy_premium_text",
+      "tsql_type": "varchar(32)", "snowflake_target": "VARCHAR(32)",
+      "trap": "numeric-LOOKING text ('2499.5000','899,50') — must NOT be auto-parsed to a number; the comma-decimal '899,50' would corrupt under numeric inference",
+      "category": "ambiguous_text_numeric", "assert": "kept as text verbatim; mapper must NOT infer numeric",
+      "detection": ["semantic_guard"], "confidence_floor": 0.8
+    }
+  ]
+}
