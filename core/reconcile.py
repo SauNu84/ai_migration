@@ -36,6 +36,7 @@ import duckdb
 from . import codegen as cg
 from . import dialect as dl
 from . import mapper as mp
+from . import target as tg
 
 # float comparison tolerances by source physical width
 _FLOAT4_SIG = 6      # REAL ~7 significant digits
@@ -353,23 +354,30 @@ def semantic_guard(prop, m: mp.Mapping,
 
 def run(code: dict[str, cg.EntityCode], mappings: list[mp.Mapping],
         udt_index: dict[tuple[str, str], str],
-        dialect: "dl.SourceDialect | None" = None) -> list[EntityResult]:
-    """Full verification run across all entities. Fresh DuckDB per run (isolation)."""
+        dialect: "dl.SourceDialect | None" = None,
+        target: "tg.TargetAdapter | None" = None) -> list[EntityResult]:
+    """Full verification run across all entities.
+
+    The execution target is a seam (SAU-432): the medallion is driven through a
+    `TargetAdapter` (default the byte-for-byte DuckDB proxy), so the same loop runs on
+    the live Snowflake path once creds land — no plumbing change. One handle is opened
+    per run and reused across entities (isolation is fresh-handle-per-run).
+    """
     dialect = dialect or dl.DEFAULT_DIALECT
+    target = target or tg.DEFAULT_TARGET
     by_entity: dict[str, list[mp.Mapping]] = {}
     for m in mappings:
         by_entity.setdefault(m.entity, []).append(m)
 
     results: list[EntityResult] = []
-    con = duckdb.connect(":memory:")
-    con.execute("SET TimeZone='UTC'")
+    handle = target.connect()
     try:
         for entity, ec in code.items():
             ms = by_entity[entity]
             src = extract_table(entity, ms, dialect)
             try:
-                run_medallion(con, ec, src)
-                tgt = read_gold(con, entity, ec.text_columns)
+                target.run_medallion(handle, ec, src)
+                tgt = target.read_gold(handle, ec)
             except Exception as exc:  # noqa: BLE001 — a failed transform IS a caught defect
                 results.append(EntityResult(
                     entity=entity, source_rows=len(src), target_rows=0,
@@ -380,5 +388,5 @@ def run(code: dict[str, cg.EntityCode], mappings: list[mp.Mapping],
             udt_by_col = {c: udt_index.get((entity, c), "") for c in ec.text_columns}
             results.append(reconcile_entity(ec, ms, src, tgt, udt_by_col, dialect))
     finally:
-        con.close()
+        target.disconnect(handle)
     return results

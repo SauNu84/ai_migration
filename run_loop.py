@@ -24,8 +24,18 @@ from core import mapper as mp
 from core import codegen as cg
 from core import gate as gate_mod
 from core import dialect as dl
+from core import target as tg
 
 REPO = Path(__file__).resolve().parent
+
+# Selectable execution targets (SAU-432). DuckDB is the default proxy (byte-for-byte
+# with SAU-305); Snowflake is the live path, guarded until SAU-308 creds land (SAU-309
+# flips `live=True`). Both run the same committed Snowflake SQL — selecting a target
+# never edits a byte of the generated artifacts.
+_TARGETS = {
+    "duckdb": lambda: tg.DuckDbAdapter(),
+    "snowflake": lambda: tg.SnowflakeAdapter(live=True),
+}
 
 # Per-source-lane defaults: profile artifact, hard-column manifest, readout labels.
 _LANES = {
@@ -72,6 +82,8 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="lift→map→codegen→verify §8 gate loop")
     ap.add_argument("--dialect", choices=sorted(_LANES), default="postgres",
                     help="source lane (selects profile/manifest/readout defaults)")
+    ap.add_argument("--target", choices=sorted(_TARGETS), default="duckdb",
+                    help="execution target (duckdb proxy [default] or live snowflake)")
     ap.add_argument("--profile")
     ap.add_argument("--manifest")
     ap.add_argument("--out", default=str(REPO / "artifacts"))
@@ -81,6 +93,7 @@ def main() -> int:
 
     lane = _LANES[args.dialect]
     dialect = lane["dialect"]()
+    target = _TARGETS[args.target]()
     profile_path = args.profile or str(lane["profile"])
     manifest_path = args.manifest or str(lane["manifest"])
     readout_path = args.readout or str(lane["readout"])
@@ -119,7 +132,8 @@ def main() -> int:
 
     # Run the §8 gate.
     gate, detail = gate_mod.run_gate(profile_path, manifest_path,
-                                     clean_runs=args.clean_runs, dialect=dialect)
+                                     clean_runs=args.clean_runs, dialect=dialect,
+                                     target=target)
     (out / f"gate_result{suffix}.json").write_text(
         json.dumps(gate.bullets, indent=2, default=str) + "\n"
     )

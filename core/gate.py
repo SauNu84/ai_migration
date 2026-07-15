@@ -27,6 +27,7 @@ from . import mapper as mp
 from . import codegen as cg
 from . import reconcile as rc
 from . import dialect as dl
+from . import target as tg
 
 REPO = Path(__file__).resolve().parent.parent
 
@@ -142,8 +143,10 @@ def _frozen_integrity_enforced(frozen: dict[str, Any]) -> bool:
 
 def run_gate(profile_path: str | Path, manifest_path: str | Path,
              *, clean_runs: int = 3, regen_iters: int = 5,
-             dialect: "dl.SourceDialect | None" = None) -> tuple[GateResult, dict[str, Any]]:
+             dialect: "dl.SourceDialect | None" = None,
+             target: "tg.TargetAdapter | None" = None) -> tuple[GateResult, dict[str, Any]]:
     dialect = dialect or dl.DEFAULT_DIALECT
+    target = target or tg.DEFAULT_TARGET
     profile = ont.load_profile(profile_path)
     manifest = json.loads(Path(manifest_path).read_text())
     hard = manifest["hard_columns"]
@@ -164,7 +167,7 @@ def run_gate(profile_path: str | Path, manifest_path: str | Path,
     consecutive = 0
     compile_errors = cg.compile_check(code)
     for i in range(clean_runs):
-        results = rc.run(code, maps, udt_index, dialect=dialect)
+        results = rc.run(code, maps, udt_index, dialect=dialect, target=target)
         clean, problems = _all_clean(results)
         ncols = sum(len(r.columns) for r in results)
         run_summaries.append({"run": i + 1, "clean": clean,
@@ -259,7 +262,7 @@ def run_gate(profile_path: str | Path, manifest_path: str | Path,
     # ── Bullet 4: hard-fail detection (negative/ablation + semantic guard) ───
     naive = naive_mappings(maps, hard_cols)
     naive_code = cg.generate(naive)
-    naive_results = rc.run(naive_code, naive, udt_index, dialect=dialect)
+    naive_results = rc.run(naive_code, naive, udt_index, dialect=dialect, target=target)
     naive_index = {(m.entity, m.column): m for m in naive}
     caught = []
     for h in hard:
