@@ -98,18 +98,19 @@ class TestDiagnosticsAreBounded(unittest.TestCase):
         for i, flag in enumerate(cr.red_flags):
             self.assertTrue(flag.startswith(f"row {i}: exact-class mismatch"), flag)
 
-    def test_a_broken_mapping_no_longer_costs_more_than_a_clean_one(self):
-        """The inverted failure mode, measured.
+    def test_reconciliation_peak_is_flat_in_row_count(self):
+        """The headline SAU-511 property, measured on both arms.
 
-        The defect was never "reconciliation uses memory" — it was that a *broken*
-        mapping used ~20x what a clean one did (measured on a 10-column table: 1.3 MB
-        clean vs 26.2 MB all-mismatch at 50k rows), so the run that had something to
-        report died before reporting it.
+        Reconciliation's *own* allocation must not grow with row count. The input rows
+        are built outside the tracemalloc window on purpose: what is under test is what
+        reconciliation allocates given rows, not the cost of holding them (that is the
+        extraction/read half, fixed by streaming in `run()`).
 
-        The comparison is therefore broken-vs-clean at the SAME row count, which
-        isolates the diagnostic term. The rows and canon lists are a linear cost common
-        to both arms — that is the streaming half of SAU-511 and is deliberately NOT
-        what this test measures.
+        Pre-SAU-511 both arms were linear — one canonical list per column per side, plus
+        one dict + one formatted string per mismatching row. Measured on a 10-column
+        table: 0.3 MB clean / 5.2 MB all-mismatch at 10k rows, rising to 1.3 MB / 26.2 MB
+        at 50k. Now the digests are O(columns) and the sample is capped, so a 20x
+        increase in rows must produce no meaningful increase in peak.
         """
         def peak(n: int, *, broken: bool) -> int:
             src = _rows(n, ["a"], broken=False)
@@ -124,13 +125,47 @@ class TestDiagnosticsAreBounded(unittest.TestCase):
             self.assertEqual(res.columns[0].n_mismatches, n if broken else 0)
             return mark
 
-        n = 20_000
-        clean, broken = peak(n, broken=False), peak(n, broken=True)
-        # Post-fix the two arms differ only by the bounded 10-row sample, so the broken
-        # arm must stay within a small constant factor of the clean one. Pre-fix this
-        # ratio was ~20x and grew with n.
-        self.assertLess(broken, clean * 2,
-                        f"broken run still costs more than clean: {clean} → {broken} bytes")
+        for broken in (False, True):
+            small = peak(1_000, broken=broken)
+            large = peak(20_000, broken=broken)
+            arm = "all-mismatch" if broken else "clean"
+            # 20x the rows. Linear behaviour would show ~20x here; flat behaviour shows
+            # ~1x. A 2x allowance absorbs allocator noise at these small absolute sizes
+            # while still failing decisively on any per-row retention.
+            self.assertLess(large, small * 2,
+                            f"{arm} arm still scales with rows: "
+                            f"1k={small}B → 20k={large}B")
+
+    def test_broken_and_clean_arms_cost_the_same_order(self):
+        """The inverted failure mode itself.
+
+        The defect was never "reconciliation uses memory" — it was that a *broken*
+        mapping cost ~20x a clean one (30.5x measured on this 1-column fixture), so the
+        run that had something to report died before reporting it. The two arms now
+        differ only by the bounded 10-row sample: a constant, not a multiple of n.
+        """
+        def arms(n: int) -> tuple[int, int]:
+            out = []
+            for broken in (False, True):
+                src = _rows(n, ["a"], broken=False)
+                tgt = _rows(n, ["a"], broken=broken)
+                tracemalloc.start()
+                try:
+                    rc.reconcile_entity(_Ec(), [_mapping("a")], src, tgt, {"a": "text"})
+                    out.append(tracemalloc.get_traced_memory()[1])
+                finally:
+                    tracemalloc.stop()
+            return out[0], out[1]
+
+        clean_small, broken_small = arms(1_000)
+        clean_large, broken_large = arms(20_000)
+        # The gap between the arms is the capped sample. It must be a CONSTANT: growing
+        # the input 20x must not grow the gap. Pre-fix the gap was ~linear in n.
+        gap_small = broken_small - clean_small
+        gap_large = broken_large - clean_large
+        self.assertLess(gap_large, max(gap_small * 2, 4096),
+                        f"broken/clean gap still scales: 1k={gap_small}B → "
+                        f"20k={gap_large}B")
 
 
 if __name__ == "__main__":

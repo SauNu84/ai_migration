@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -208,67 +209,162 @@ class EntityResult:
     exec_error: str | None = None
 
 
+class ChecksumAccumulator:
+    """Incremental, order-sensitive checksum over canonical values (SAU-511).
+
+    Byte-identical to the previous `_checksum(list)` by construction — same md5, same
+    index-prefixed framing, same NULL sentinel — but fed one value at a time, so the
+    digest never requires the column's values to exist simultaneously. `_checksum` is
+    now a thin wrapper over this, which makes the equivalence structural rather than a
+    property that has to be re-asserted.
+    """
+
+    __slots__ = ("_h", "_n")
+
+    def __init__(self) -> None:
+        self._h = hashlib.md5()
+        self._n = 0
+
+    def update(self, v: str | None) -> None:
+        self._h.update(str(self._n).encode())
+        self._h.update(b"\x1f")
+        self._h.update(b"\x00NULL\x00" if v is None else v.encode("utf-8"))
+        self._h.update(b"\x1e")
+        self._n += 1
+
+    @property
+    def n(self) -> int:
+        return self._n
+
+    def hexdigest(self) -> str:
+        return self._h.hexdigest()
+
+
 def _checksum(values: list[str | None]) -> str:
-    h = hashlib.md5()
-    for i, v in enumerate(values):
-        h.update(str(i).encode())
-        h.update(b"\x1f")
-        h.update(b"\x00NULL\x00" if v is None else v.encode("utf-8"))
-        h.update(b"\x1e")
-    return h.hexdigest()
+    acc = ChecksumAccumulator()
+    for v in values:
+        acc.update(v)
+    return acc.hexdigest()
 
 
-def reconcile_entity(ec: cg.EntityCode, mappings: list[mp.Mapping],
-                     source_rows: list[dict[str, Any]],
-                     target_rows: list[dict[str, Any]],
-                     udt_by_col: dict[str, str],
-                     dialect: "dl.SourceDialect | None" = None) -> EntityResult:
-    dialect = dialect or dl.DEFAULT_DIALECT
-    cols = sorted(mappings, key=lambda m: m.column)
-    col_results: list[ColumnResult] = []
-    n = min(len(source_rows), len(target_rows))
-    row_match = len(source_rows) == len(target_rows)
+class EntityDigest:
+    """One side (source or target) of an entity reconciliation, accumulated row by row.
 
-    for m in cols:
-        udt = udt_by_col.get(m.column, "")
-        src_canon = [canonicalize(m.reconcile, r.get(m.column), source_udt=udt, dialect=dialect)
-                     for r in source_rows]
-        tgt_canon = [canonicalize(m.reconcile, r.get(m.column), source_udt=udt, dialect=dialect)
-                     for r in target_rows]
-        scs, tcs = _checksum(src_canon), _checksum(tgt_canon)
-        # Diagnostics are bounded at COLLECTION time. Appending every mismatching row and
-        # slicing to [:10] only at ColumnResult construction inverted the failure mode: a
-        # clean run cost nothing while a *systematically broken* mapping — precisely what
-        # the gate exists to catch — allocated one dict + one formatted string per row and
-        # OOM'd first. The cheap path stayed cheap and the diagnostic path exploded. The
-        # retained content is unchanged (the slice already kept the first 10); only the
-        # rows past the cap are no longer built. `n_mismatches` keeps the full scale.
-        mismatches: list[dict[str, Any]] = []
-        red: list[str] = []
-        n_mismatch = 0
-        for i in range(n):
-            sv, tv = src_canon[i], tgt_canon[i]
+    Holds exactly one `ChecksumAccumulator` per mapped column plus a row counter, so its
+    footprint is O(columns) — independent of row count. Rows are pushed in PK order via
+    `add()`; nothing is retained after the canonical value is folded into the digest.
+    """
+
+    def __init__(self, mappings: list[mp.Mapping], udt_by_col: dict[str, str],
+                 dialect: "dl.SourceDialect | None" = None) -> None:
+        self._dialect = dialect or dl.DEFAULT_DIALECT
+        self._cols = sorted(mappings, key=lambda m: m.column)
+        self._udt = udt_by_col
+        self._acc = {m.column: ChecksumAccumulator() for m in self._cols}
+        self._n_rows = 0
+
+    def add(self, row: dict[str, Any]) -> None:
+        for m in self._cols:
+            self._acc[m.column].update(
+                canonicalize(m.reconcile, row.get(m.column),
+                             source_udt=self._udt.get(m.column, ""),
+                             dialect=self._dialect)
+            )
+        self._n_rows += 1
+
+    @property
+    def n_rows(self) -> int:
+        return self._n_rows
+
+    def checksum(self, column: str) -> str:
+        return self._acc[column].hexdigest()
+
+
+def _red_flag(m: mp.Mapping, i: int, sv: str | None, tv: str | None) -> str:
+    """Classify one mismatching row into its red-flag wording (unchanged from SAU-305)."""
+    if sv is not None and tv is None:
+        return f"row {i}: NOT-NULL source value silently dropped to NULL"
+    if m.reconcile in (mp.RC_EXACT_TEXT, mp.RC_TS_INSTANT, mp.RC_TS_WALL):
+        return (f"row {i}: exact-class mismatch ({m.semantic_type}) "
+                f"'{sv}' → '{tv}' — silent precision/identity loss")
+    if m.reconcile == mp.RC_APPROX_FLOAT:
+        return f"row {i}: float drift beyond epsilon '{sv}' → '{tv}'"
+    return f"row {i}: {m.reconcile} mismatch '{sv}' → '{tv}'"
+
+
+def _diagnose(mappings: list[mp.Mapping], columns: list[str],
+              pairs: "Iterator[tuple[dict[str, Any], dict[str, Any]]]",
+              udt_by_col: dict[str, str],
+              dialect: "dl.SourceDialect") -> dict[str, tuple[list, list, int]]:
+    """Second, DIAGNOSTIC-ONLY pass: collect bounded mismatch samples for `columns`.
+
+    Runs only when the verdict is already known to be dirty, and only over the columns
+    whose checksums actually disagree — a clean run never enters here at all.
+
+    The walk covers every row, but **collection** is capped: past `_DIAG_CAP` a
+    mismatching row is counted and discarded, never formatted or retained. So the pass
+    is O(rows) in time and O(columns x cap) in memory. Walking to the end rather than
+    stopping at saturation is deliberate: memory is the defect under repair, not time,
+    and it keeps `n_mismatches` an exact count. A field that means "total" on small
+    inputs and "at least" on large ones would be worse than no field — "3.2M of 10M rows
+    mismatch" is the number that tells an operator whether a mapping is subtly wrong or
+    categorically wrong.
+
+    The pass consumes `pairs` (zipped source/target rows) lazily and retains nothing
+    beyond the capped samples.
+    """
+    wanted = set(columns)
+    by_col = {m.column: m for m in mappings if m.column in wanted}
+    out: dict[str, tuple[list, list, int]] = {c: ([], [], 0) for c in by_col}
+    if not by_col:
+        return out
+    for i, (srow, trow) in enumerate(pairs):
+        for col, m in by_col.items():
+            mism, red, n_mis = out[col]
+            udt = udt_by_col.get(col, "")
+            sv = canonicalize(m.reconcile, srow.get(col), source_udt=udt, dialect=dialect)
+            tv = canonicalize(m.reconcile, trow.get(col), source_udt=udt, dialect=dialect)
             if sv == tv:
                 continue
-            n_mismatch += 1
-            if len(mismatches) >= _DIAG_CAP:
-                continue  # keep counting, stop allocating
-            mismatches.append({"row": i, "source": sv, "target": tv})
-            # red-flag classification
-            if sv is not None and tv is None:
-                red.append(f"row {i}: NOT-NULL source value silently dropped to NULL")
-            elif m.reconcile in (mp.RC_EXACT_TEXT, mp.RC_TS_INSTANT, mp.RC_TS_WALL):
-                red.append(
-                    f"row {i}: exact-class mismatch ({m.semantic_type}) "
-                    f"'{sv}' → '{tv}' — silent precision/identity loss"
-                )
-            elif m.reconcile == mp.RC_APPROX_FLOAT:
-                red.append(
-                    f"row {i}: float drift beyond epsilon '{sv}' → '{tv}'"
-                )
-            else:
-                red.append(f"row {i}: {m.reconcile} mismatch '{sv}' → '{tv}'")
-        match = (scs == tcs) and row_match
+            if len(mism) < _DIAG_CAP:      # collect a bounded sample...
+                mism.append({"row": i, "source": sv, "target": tv})
+                red.append(_red_flag(m, i, sv, tv))
+            out[col] = (mism, red, n_mis + 1)   # ...but count in full
+    return out
+
+
+def reconcile_digests(ec: cg.EntityCode, mappings: list[mp.Mapping],
+                      src: EntityDigest, tgt: EntityDigest,
+                      udt_by_col: dict[str, str],
+                      diagnose_pairs: "Callable[[], Iterator[tuple[dict, dict]]] | None" = None,
+                      dialect: "dl.SourceDialect | None" = None) -> EntityResult:
+    """Build the `EntityResult` from two already-accumulated digests.
+
+    This is the verdict half of reconciliation and it is *streaming-complete*: everything
+    the §8 gate consumes — row counts, per-column checksums, `match` — comes from the
+    digests, which are O(columns). No row of either side is retained.
+
+    `diagnose_pairs`, when supplied, is a **factory** for a fresh zipped (source, target)
+    row walk. It is invoked at most once, and only when the verdict is already dirty, so
+    a clean run never pays for it. The verdict never depends on it: a re-read that came
+    back different would change the reported *examples*, never the pass/fail.
+    """
+    dialect = dialect or dl.DEFAULT_DIALECT
+    cols = sorted(mappings, key=lambda m: m.column)
+    row_match = src.n_rows == tgt.n_rows
+    n = min(src.n_rows, tgt.n_rows)
+
+    sums = {m.column: (src.checksum(m.column), tgt.checksum(m.column)) for m in cols}
+    dirty = [m.column for m in cols if sums[m.column][0] != sums[m.column][1]]
+
+    diag: dict[str, tuple[list, list, int]] = {}
+    if dirty and diagnose_pairs is not None:
+        diag = _diagnose(cols, dirty, diagnose_pairs(), udt_by_col, dialect)
+
+    col_results: list[ColumnResult] = []
+    for m in cols:
+        scs, tcs = sums[m.column]
+        mism, red, n_mis = diag.get(m.column, ([], [], 0))
         col_results.append(
             ColumnResult(
                 entity=m.entity,
@@ -277,20 +373,47 @@ def reconcile_entity(ec: cg.EntityCode, mappings: list[mp.Mapping],
                 confidence=m.confidence,
                 source_checksum=scs,
                 target_checksum=tcs,
-                match=match,
+                match=(scs == tcs) and row_match,
                 n_compared=n,
-                mismatches=mismatches,
+                mismatches=mism,
                 red_flags=red,
                 flagged_lossy=("lossy_float" in m.flags),
-                n_mismatches=n_mismatch,
+                n_mismatches=n_mis,
             )
         )
     return EntityResult(
         entity=ec.entity,
-        source_rows=len(source_rows),
-        target_rows=len(target_rows),
+        source_rows=src.n_rows,
+        target_rows=tgt.n_rows,
         row_match=row_match,
         columns=col_results,
+    )
+
+
+def reconcile_entity(ec: cg.EntityCode, mappings: list[mp.Mapping],
+                     source_rows: list[dict[str, Any]],
+                     target_rows: list[dict[str, Any]],
+                     udt_by_col: dict[str, str],
+                     dialect: "dl.SourceDialect | None" = None) -> EntityResult:
+    """List-based reconciliation — the original entry point, preserved verbatim.
+
+    Since SAU-511 it is a thin adapter over the streaming core: it folds both lists into
+    digests and defers to `reconcile_digests`. Callers that already hold materialized
+    rows (tests, small entities) are unchanged; the point of routing them through the
+    same core is that the existing suite exercises the streaming implementation, so
+    parity is proven by the tests that already existed rather than asserted separately.
+    """
+    dialect = dialect or dl.DEFAULT_DIALECT
+    src = EntityDigest(mappings, udt_by_col, dialect)
+    tgt = EntityDigest(mappings, udt_by_col, dialect)
+    for r in source_rows:
+        src.add(r)
+    for r in target_rows:
+        tgt.add(r)
+    return reconcile_digests(
+        ec, mappings, src, tgt, udt_by_col,
+        diagnose_pairs=lambda: zip(source_rows, target_rows),
+        dialect=dialect,
     )
 
 
