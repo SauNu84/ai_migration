@@ -28,6 +28,7 @@ import json
 import subprocess
 import sys
 from abc import ABC, abstractmethod
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -79,6 +80,16 @@ class SourceDialect(ABC):
     def extract_rows(self, entity: str, mappings: list[Any]) -> list[dict[str, Any]]:
         """Read `entity` from the source as a list of {column: text|None} rows."""
 
+    def iter_rows(self, entity: str, mappings: list[Any]) -> "Iterator[dict[str, Any]]":
+        """Stream `entity` as {column: text|None} rows, PK-ordered (SAU-511).
+
+        Same wire form and same order as `extract_rows`, yielded one row at a time so the
+        caller never has to hold the table. The default implementation materializes via
+        `extract_rows` — correct, and it keeps every existing dialect (and test stub)
+        working unchanged — but a lane that can genuinely stream should override it.
+        """
+        return iter(self.extract_rows(entity, mappings))
+
     # ── Seam 3: physical-type token table ───────────────────────────────────
     @abstractmethod
     def physical_token(self, data_type: str, udt: str) -> str:
@@ -101,6 +112,45 @@ class SourceDialect(ABC):
 # ── PostgresDialect — the first implementation (SAU-303/305 behavior, verbatim) ──
 
 _REPO = Path(__file__).resolve().parent.parent
+
+
+def _stream_json_lines(cmd: list[str], *, context: str,
+                       keep: "Any" = None) -> Iterator[dict[str, Any]]:
+    """Run `cmd` and yield one parsed JSON object per matching stdout line (SAU-511).
+
+    The extraction wire form is already one self-contained JSON object per row, which is
+    what makes streaming a read change rather than a protocol change: `subprocess.run(
+    capture_output=True)` buffered the entire table into one string (and then `json.loads`
+    built the whole list) purely because nothing asked for it incrementally.
+
+    `keep` is an optional predicate selecting data lines (the SQL Server lane must skip
+    header/warning lines that some sqlcmd flavours interpose); the default keeps every
+    non-blank line, matching the Postgres reader.
+
+    Non-zero exit is raised as `SystemExit` *after* the stream drains, identical to the
+    batch readers. The process is always reaped: if the consumer abandons the generator
+    part-way (the diagnostic pass stops early on a saturated sample), the `finally` kills
+    the child rather than leaking it.
+    """
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            text=True)
+    try:
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            line = line.strip()
+            if line and (keep is None or keep(line)):
+                yield json.loads(line)
+        rc = proc.wait()
+        if rc != 0:
+            sys.stderr.write(proc.stderr.read() if proc.stderr else "")
+            raise SystemExit(f"{context} failed (exit {rc})")
+    finally:
+        if proc.poll() is None:      # consumer abandoned the generator
+            proc.kill()
+            proc.wait()
+        for pipe in (proc.stdout, proc.stderr):
+            if pipe is not None and not pipe.closed:
+                pipe.close()
 
 # Postgres physical-type recognition tables (was hard-wired in ontology.infer_property).
 _PG_ARRAY_NUMERIC_HINT = ("numeric", "int", "float", "numer")
@@ -159,24 +209,41 @@ class PostgresDialect(SourceDialect):
             return f"{col}::text"
         return f"{col}::text"
 
-    def extract_rows(self, entity: str, mappings: list[Any]) -> list[dict[str, Any]]:
+    def _extract_sql(self, entity: str, mappings: list[Any]) -> str:
+        """The extraction query: one JSON object per row, PK-ordered."""
         cols = sorted(mappings, key=lambda m: m.column)
         pairs = ",\n      ".join(
             f"'{m.column}', ({self.extraction_expr(m.column, m.reconcile)})" for m in cols
         )
         has_id = any(m.column == "id" for m in cols)
         order = 'ORDER BY "id"' if has_id else ""
-        sql = (
+        return (
             f"SELECT json_build_object(\n      {pairs}\n    )::text "
             f'FROM "{entity}" {order}'
         )
-        out = self._psql(sql, context=f"psql extract {entity}")
+
+    def extract_rows(self, entity: str, mappings: list[Any]) -> list[dict[str, Any]]:
+        out = self._psql(self._extract_sql(entity, mappings),
+                         context=f"psql extract {entity}")
         rows: list[dict[str, Any]] = []
         for line in out.splitlines():
             line = line.strip()
             if line:
                 rows.append(json.loads(line))
         return rows
+
+    #: Rows per server-side FETCH. psql without this pulls the *entire* result set into
+    #: the client before printing a byte, which would move the O(table) buffer from
+    #: Python into psql rather than removing it. Setting FETCH_COUNT switches psql to a
+    #: cursor, so the table is never fully resident on either side of the pipe.
+    FETCH_COUNT = 1000
+
+    def iter_rows(self, entity: str, mappings: list[Any]) -> Iterator[dict[str, Any]]:
+        """Stream the extraction, cursor-backed end to end (SAU-511)."""
+        cmd = ["psql", "-X", "-tA", "-v", "ON_ERROR_STOP=1",
+               "-v", f"FETCH_COUNT={self.FETCH_COUNT}",
+               "-c", self._extract_sql(entity, mappings)]
+        return _stream_json_lines(cmd, context=f"psql extract {entity}")
 
     # ── Seam 3 ──
     def physical_token(self, data_type: str, udt: str) -> str:
@@ -271,14 +338,13 @@ class SqlServerDialect(SourceDialect):
         # The profiler proc prints one JSON document (FOR JSON) for `schema`.
         return f"EXEC dbo.phase0_profile @target_schema = N'{schema}';"
 
-    def _sqlcmd(self, sql: str, *, context: str = "sqlcmd",
-                input_file: str | None = None) -> str:
-        """Run T-SQL via sqlcmd and return stdout.
+    def _sqlcmd_argv(self, sql: str, *, input_file: str | None = None) -> list[str]:
+        """Build the sqlcmd command line. Shared by the batch and streaming readers so
+        both issue byte-identical invocations.
 
         Connection comes from the standard env the SQL Server rig uses (mirrors
         sqlserver/scripts/setup.sh): MSSQL_HOST / MSSQL_HOST_PORT / MSSQL_SA_PASSWORD /
-        MSSQL_DATABASE, with $SQLCMD overriding the binary. `-h -1` strips headers and
-        `-y 0`/`-Y 0` keep wide values un-truncated so the JSON/wire form is lossless.
+        MSSQL_DATABASE, with $SQLCMD overriding the binary.
         """
         import os
         host = os.environ.get("MSSQL_HOST", "localhost")
@@ -293,13 +359,19 @@ class SqlServerDialect(SourceDialect):
         # rejects the classic `-h -1 -y 0 -Y 0 -W` combo: `-h`+`-y 0` and `-W`+`-y` are
         # mutually exclusive there.) `-h -1` is omitted because it conflicts with `-y 0`;
         # any header line a flavour still prints is dropped by the `{`-prefixed row filter
-        # in extract_rows, so the wire form stays losslessly parseable on either tool.
+        # in `_is_data_line`, so the wire form stays losslessly parseable on either tool.
         cmd = [binary, "-S", f"{host},{port}", "-U", user, "-P", pwd, "-d", db,
                "-C", "-b", "-y", "0"]
         if input_file is not None:
             cmd += ["-i", input_file]
         else:
             cmd += ["-Q", sql]
+        return cmd
+
+    def _sqlcmd(self, sql: str, *, context: str = "sqlcmd",
+                input_file: str | None = None) -> str:
+        """Run T-SQL via sqlcmd and return stdout."""
+        cmd = self._sqlcmd_argv(sql, input_file=input_file)
         proc = subprocess.run(cmd, capture_output=True, text=True)
         if proc.returncode != 0:
             sys.stderr.write(proc.stderr)
@@ -372,33 +444,51 @@ class SqlServerDialect(SourceDialect):
         # type-aware `_wire_expr` (Mapping carries the source type) for full fidelity.
         return self._wire_expr(column, "", reconcile)
 
-    def extract_rows(self, entity: str, mappings: list[Any]) -> list[dict[str, Any]]:
+    def _extract_sql(self, entity: str, mappings: list[Any]) -> str:
+        """The extraction query: one FOR JSON object per row, PK-ordered.
+
+        FOR JSON keys off the column alias, so each output line is a parseable row in the
+        same {column: text|None} shape the Postgres lane returns. INCLUDE_NULL_VALUES
+        keeps NULL keys present (FOR JSON drops them by default), so a NULL is a real
+        None in the row rather than a missing column.
+        """
         cols = sorted(mappings, key=lambda m: m.column)
-        # One JSON object per row (FOR JSON keys off the column alias), so each output
-        # line is a parseable row in the same {column: text|None} shape Postgres returns.
-        # INCLUDE_NULL_VALUES keeps NULL keys present (rather than FOR JSON's default of
-        # dropping them), so a NULL is a real None in the row, not a missing column.
         pairs = ",\n      ".join(
             f"({self._wire_expr(m.column, m.pg_type, m.reconcile)}) AS [{m.column}]"
             for m in cols
         )
         has_id = any(m.column == "id" for m in cols)
         order = 'ORDER BY [id]' if has_id else ""
-        sql = (
+        return (
             "SET NOCOUNT ON;\n"
             f"SELECT (SELECT {pairs} "
             f"FOR JSON PATH, WITHOUT_ARRAY_WRAPPER, INCLUDE_NULL_VALUES) AS row_json\n"
             f"FROM [{entity}] {order}"
         )
-        out = self._sqlcmd(sql, context=f"sqlcmd extract {entity}")
+
+    @staticmethod
+    def _is_data_line(line: str) -> bool:
+        # Each row is one FOR JSON object → one line. Skip any header / separator /
+        # warning lines a sqlcmd flavour may interpose: a data line starts with '{'.
+        return line.startswith("{")
+
+    def extract_rows(self, entity: str, mappings: list[Any]) -> list[dict[str, Any]]:
+        out = self._sqlcmd(self._extract_sql(entity, mappings),
+                           context=f"sqlcmd extract {entity}")
         rows: list[dict[str, Any]] = []
         for line in out.splitlines():
             line = line.strip()
-            # Each row is one FOR JSON object → one line. Skip any header / separator /
-            # warning lines a sqlcmd flavour may interpose: a data line starts with '{'.
-            if line.startswith("{"):
+            if self._is_data_line(line):
                 rows.append(json.loads(line))
         return rows
+
+    def iter_rows(self, entity: str, mappings: list[Any]) -> Iterator[dict[str, Any]]:
+        """Stream the extraction (SAU-511). Same wire form, same order, same filter."""
+        return _stream_json_lines(
+            self._sqlcmd_argv(self._extract_sql(entity, mappings)),
+            context=f"sqlcmd extract {entity}",
+            keep=self._is_data_line,
+        )
 
     # ── Seam 3: physical-type token table ───────────────────────────────────
     def physical_token(self, data_type: str, udt: str) -> str:

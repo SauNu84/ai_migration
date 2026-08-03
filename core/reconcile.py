@@ -14,6 +14,28 @@ the source, byte/precision-exact where the manifest demands it:
   4. **Red flags** (hard fail regardless of run count): row loss, a NOT-NULL source
      value turning NULL, or any exact-class mismatch (silent precision/identity loss).
 
+**Streaming (SAU-511).** The loop holds no table. Each entity is reconciled in one walk
+of the source and one of Gold:
+
+  * `dialect.iter_rows()` streams the source (cursor-backed, so neither Python nor the
+    client tool buffers the table), `_tee` folds every row into an `EntityDigest` on its
+    way into the batched Bronze load, and `target.iter_gold()` streams Gold back through
+    a second digest. A digest is one checksum accumulator per column — O(columns).
+  * The verdict (row counts, per-column checksums, `match`) comes entirely from the
+    digests. Only when it is already dirty does a third, diagnostic-only pass re-read
+    both sides to collect a bounded sample of example mismatches; a clean run never pays
+    for it, and the verdict never depends on it.
+
+Measured through the full `run()` chassis (6-column entity, Python-side peak): 1k rows
+7 KB, 1M rows 7 KB. The pre-SAU-511 loop materialized the source list, the load's tuple
+list and Gold's `fetchall` — ~272 B/cell, extrapolating to ~2.7 GB at 1M x 10 cols.
+
+What is NOT pushed down: `canonicalize()` still runs in Python on both sides. Computing
+the digest in-engine would mean reimplementing every reconcile strategy in each target
+SQL dialect and proving the two implementations agree bit-for-bit — a correctness risk
+that dwarfs the memory win, and pushing down only one side would break comparison parity
+outright. Streaming gets the same bound with the comparison semantics untouched.
+
 Why DuckDB and not live Snowflake: Phase 0 has no Snowflake account. DuckDB is an
 independent SQL engine (≠ the source) with Snowflake-like DECIMAL/timestamp semantics,
 so a transform that only worked by leaning on source-engine behavior is still caught.
@@ -72,16 +94,57 @@ def run_medallion(con: duckdb.DuckDBPyConnection, ec: cg.EntityCode,
     con.execute(ec.gold_sql["duckdb"])
 
 
+def load_medallion(con: duckdb.DuckDBPyConnection, ec: cg.EntityCode,
+                   rows: Iterable[dict[str, Any]], *, batch: int = 5_000) -> None:
+    """Streaming twin of `run_medallion` (SAU-511).
+
+    Identical statements in an identical order — Bronze DDL, the same parameterized
+    INSERT, Silver, Gold — but the wire rows are consumed from an iterable and flushed
+    every `batch` rows instead of being turned into one N-row tuple list first. The
+    caller may be teeing the same iterator into a checksum accumulator, so `rows` is
+    consumed exactly once, in order.
+    """
+    cols = ec.text_columns  # name-sorted, matches codegen projection order
+    con.execute(ec.bronze_ddl["duckdb"])
+    placeholders = ", ".join("?" for _ in cols)
+    insert = f'INSERT INTO "bronze_{ec.entity}" VALUES ({placeholders})'
+    buf: list[tuple] = []
+    for r in rows:
+        buf.append(tuple(r.get(c) for c in cols))
+        if len(buf) >= batch:
+            con.executemany(insert, buf)
+            buf.clear()
+    if buf:
+        con.executemany(insert, buf)
+    con.execute(ec.silver_sql["duckdb"])
+    con.execute(ec.gold_sql["duckdb"])
+
+
+def _gold_sql(entity: str, cols: list[str]) -> str:
+    order = 'ORDER BY "id"' if "id" in cols else ""
+    quoted = ", ".join(f'"{c}"' for c in cols)
+    return f'SELECT {quoted} FROM "gold_{entity}" {order}'
+
+
 def read_gold(con: duckdb.DuckDBPyConnection, entity: str,
               cols: list[str]) -> list[dict[str, Any]]:
-    has_id = "id" in cols
-    order = 'ORDER BY "id"' if has_id else ""
-    quoted = ", ".join(f'"{c}"' for c in cols)
-    cur = con.execute(f'SELECT {quoted} FROM "gold_{entity}" {order}')
+    cur = con.execute(_gold_sql(entity, cols))
     out = []
     for row in cur.fetchall():
         out.append({c: row[i] for i, c in enumerate(cols)})
     return out
+
+
+def iter_gold(con: duckdb.DuckDBPyConnection, entity: str, cols: list[str],
+              *, batch: int = 5_000) -> Iterator[dict[str, Any]]:
+    """Streaming twin of `read_gold` (SAU-511): same query, same order, `fetchmany`."""
+    cur = con.execute(_gold_sql(entity, cols))
+    while True:
+        chunk = cur.fetchmany(batch)
+        if not chunk:
+            return
+        for row in chunk:
+            yield {c: row[i] for i, c in enumerate(cols)}
 
 
 # ── 3. Canonicalization by reconcile strategy ───────────────────────────────
@@ -496,6 +559,69 @@ def semantic_guard(prop, m: mp.Mapping,
     return flags
 
 
+class SourceReadError(Exception):
+    """A failure originating in the SOURCE read (or its canonicalization), not the target.
+
+    Streaming puts the source walk *inside* the target's execution call — the rows are
+    pulled lazily by the Bronze load. Without this marker the `except Exception` that
+    records a transform `exec_error` would also swallow a failed extraction and report
+    it as a caught transform defect: the gate would show a red flag it did not actually
+    earn, and a genuinely broken source read would look like a successful detection.
+    That is the masking failure mode §8 exists to forbid, so source failures are tagged
+    here and deliberately re-raised.
+    """
+
+
+def _iter_source(dialect: "dl.SourceDialect", entity: str,
+                 mappings: list[mp.Mapping]) -> Iterator[dict[str, Any]]:
+    """Stream source rows, falling back to the materializing read.
+
+    `SourceDialect` supplies `iter_rows`, but the dialect seam is duck-typed at several
+    call sites (test stubs implement only `extract_rows`), so a missing streaming method
+    degrades to the batch read rather than exploding.
+    """
+    it = getattr(dialect, "iter_rows", None)
+    if it is not None:
+        return iter(it(entity, mappings))
+    return iter(extract_table(entity, mappings, dialect))
+
+
+def _iter_target(target: "tg.TargetAdapter", handle: Any,
+                 ec: cg.EntityCode) -> Iterator[dict[str, Any]]:
+    """Stream Gold rows, falling back to the materializing read for duck-typed adapters."""
+    it = getattr(target, "iter_gold", None)
+    if it is not None:
+        return iter(it(handle, ec))
+    return iter(target.read_gold(handle, ec))
+
+
+def _load_target(target: "tg.TargetAdapter", handle: Any, ec: cg.EntityCode,
+                 rows: Iterable[dict[str, Any]]) -> None:
+    """Load the medallion from a row stream, falling back for duck-typed adapters."""
+    load = getattr(target, "load_medallion", None)
+    if load is not None:
+        load(handle, ec, rows)
+    else:
+        target.run_medallion(handle, ec, list(rows))
+
+
+def _tee(rows: Iterable[dict[str, Any]],
+         sink: "Callable[[dict[str, Any]], None]") -> Iterator[dict[str, Any]]:
+    """Yield each row after handing it to `sink` — one walk, two consumers.
+
+    Failures on either side of the tee are the SOURCE's, so they are tagged as such and
+    kept distinguishable from a target/transform failure. `BaseException` (notably the
+    `SystemExit` a failed psql/sqlcmd raises) is left alone — it already bypasses the
+    target's `except Exception`.
+    """
+    try:
+        for r in rows:
+            sink(r)
+            yield r
+    except Exception as exc:
+        raise SourceReadError(f"{type(exc).__name__}: {exc}") from exc
+
+
 def run(code: dict[str, cg.EntityCode], mappings: list[mp.Mapping],
         udt_index: dict[tuple[str, str], str],
         dialect: "dl.SourceDialect | None" = None,
@@ -518,19 +644,44 @@ def run(code: dict[str, cg.EntityCode], mappings: list[mp.Mapping],
     try:
         for entity, ec in code.items():
             ms = by_entity[entity]
-            src = extract_table(entity, ms, dialect)
+            udt_by_col = {c: udt_index.get((entity, c), "") for c in ec.text_columns}
+            src_digest = EntityDigest(ms, udt_by_col, dialect)
             try:
-                target.run_medallion(handle, ec, src)
-                tgt = target.read_gold(handle, ec)
+                # Pass 1 — ONE walk of the source serves both consumers: each row is
+                # folded into the source digest on its way into the Bronze load. Neither
+                # the extraction nor the load ever holds the table.
+                _load_target(
+                    target, handle, ec,
+                    _tee(_iter_source(dialect, entity, ms), src_digest.add),
+                )
+                # Pass 2 — stream Gold back through the target digest.
+                tgt_digest = EntityDigest(ms, udt_by_col, dialect)
+                for row in _iter_target(target, handle, ec):
+                    tgt_digest.add(row)
+            except SourceReadError:
+                # NOT a transform defect — the source never delivered. Propagate loudly
+                # rather than recording it as a caught defect (see SourceReadError).
+                raise
             except Exception as exc:  # noqa: BLE001 — a failed transform IS a caught defect
+                # `source_rows` is what the digest actually consumed. If the failure was
+                # in Silver/Gold the source was fully read and this is the true count; if
+                # the Bronze load itself failed it is a partial count, which is the
+                # honest number for a run that never finished reading.
                 results.append(EntityResult(
-                    entity=entity, source_rows=len(src), target_rows=0,
+                    entity=entity, source_rows=src_digest.n_rows, target_rows=0,
                     row_match=False, columns=[],
                     exec_error=f"{type(exc).__name__}: {exc}",
                 ))
                 continue
-            udt_by_col = {c: udt_index.get((entity, c), "") for c in ec.text_columns}
-            results.append(reconcile_entity(ec, ms, src, tgt, udt_by_col, dialect))
+            results.append(reconcile_digests(
+                ec, ms, src_digest, tgt_digest, udt_by_col,
+                # Pass 3 — diagnostics only, and only if the verdict is already dirty.
+                # A fresh zipped re-read of both sides; see `reconcile_digests`.
+                diagnose_pairs=lambda ec=ec, ms=ms, entity=entity: zip(
+                    _iter_source(dialect, entity, ms), _iter_target(target, handle, ec)
+                ),
+                dialect=dialect,
+            ))
     finally:
         target.disconnect(handle)
     return results

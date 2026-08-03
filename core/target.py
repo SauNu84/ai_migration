@@ -34,6 +34,7 @@ import json
 import os
 import tempfile
 from abc import ABC, abstractmethod
+from collections.abc import Iterable, Iterator
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:  # avoid importing codegen at module load (it pulls sqlglot)
@@ -64,6 +65,24 @@ class TargetAdapter(ABC):
     @abstractmethod
     def read_gold(self, handle: Any, ec: "cg.EntityCode") -> list[dict[str, Any]]:
         """Read Gold as a list of {column: value} rows, PK-ordered (matches source order)."""
+
+    # ── streaming seams (SAU-511) ────────────────────────────────────────────
+    # Both default to the materializing implementations above, so an adapter that has
+    # not been upgraded still works and every existing test stub is unaffected. An
+    # adapter that can genuinely stream overrides them.
+
+    def load_medallion(self, handle: Any, ec: "cg.EntityCode",
+                       rows: "Iterable[dict[str, Any]]") -> None:
+        """Same as `run_medallion`, but consuming `rows` as a stream.
+
+        The caller may pass a generator it is teeing into a checksum accumulator, so the
+        contract is that rows are consumed **once, in order**.
+        """
+        self.run_medallion(handle, ec, list(rows))
+
+    def iter_gold(self, handle: Any, ec: "cg.EntityCode") -> "Iterator[dict[str, Any]]":
+        """Same as `read_gold`, but yielding rows one at a time in the same PK order."""
+        return iter(self.read_gold(handle, ec))
 
 
 # ── DuckDbAdapter — the default execution proxy (byte-for-byte with SAU-305) ──
@@ -96,6 +115,22 @@ class DuckDbAdapter(TargetAdapter):
     def read_gold(self, handle: Any, ec: "cg.EntityCode") -> list[dict[str, Any]]:
         from . import reconcile as rc
         return rc.read_gold(handle, ec.entity, ec.text_columns)
+
+    # ── streaming (SAU-511) ─────────────────────────────────────────────────
+    #: Rows per `executemany` / `fetchmany`. Large enough that the per-batch round trip
+    #: is amortised, small enough that the resident set is a constant independent of
+    #: table size. The executed SQL is unchanged — only the batching of the load and the
+    #: fetching of Gold differ, so the medallion the §8 gate validates is identical.
+    BATCH = 5_000
+
+    def load_medallion(self, handle: Any, ec: "cg.EntityCode",
+                       rows: "Iterable[dict[str, Any]]") -> None:
+        from . import reconcile as rc
+        rc.load_medallion(handle, ec, rows, batch=self.BATCH)
+
+    def iter_gold(self, handle: Any, ec: "cg.EntityCode") -> "Iterator[dict[str, Any]]":
+        from . import reconcile as rc
+        return rc.iter_gold(handle, ec.entity, ec.text_columns, batch=self.BATCH)
 
 
 # ── SnowflakeAdapter — the live path (guarded until SAU-308 creds land) ───────
@@ -153,17 +188,52 @@ class SnowflakeAdapter(TargetAdapter):
         finally:
             cur.close()
 
+    def _gold_sql(self, ec: "cg.EntityCode") -> str:
+        cols = ec.text_columns
+        order = 'ORDER BY "id"' if "id" in cols else ""
+        quoted = ", ".join(f'"{c}"' for c in cols)
+        return f'SELECT {quoted} FROM "gold_{ec.entity}" {order}'
+
     def read_gold(self, handle: Any, ec: "cg.EntityCode") -> list[dict[str, Any]]:
         cur = handle.cursor()
         try:
             cols = ec.text_columns
-            order = 'ORDER BY "id"' if "id" in cols else ""
-            quoted = ", ".join(f'"{c}"' for c in cols)
-            cur.execute(f'SELECT {quoted} FROM "gold_{ec.entity}" {order}')
+            cur.execute(self._gold_sql(ec))
             out: list[dict[str, Any]] = []
             for row in cur.fetchall():
                 out.append({c: row[i] for i, c in enumerate(cols)})
             return out
+        finally:
+            cur.close()
+
+    # ── streaming (SAU-511) ─────────────────────────────────────────────────
+    #: Rows per `fetchmany` on the Gold read-back.
+    BATCH = 5_000
+
+    def load_medallion(self, handle: Any, ec: "cg.EntityCode",
+                       rows: "Iterable[dict[str, Any]]") -> None:
+        cur = handle.cursor()
+        try:
+            self.execute_medallion(cur, ec, rows)
+        finally:
+            cur.close()
+
+    def iter_gold(self, handle: Any, ec: "cg.EntityCode") -> "Iterator[dict[str, Any]]":
+        """Stream Gold via `fetchmany`, same query and order as `read_gold`.
+
+        The cursor is held open for the life of the generator and closed in the `finally`
+        even if the consumer abandons it part-way (the diagnostic pass may).
+        """
+        cols = ec.text_columns
+        cur = handle.cursor()
+        try:
+            cur.execute(self._gold_sql(ec))
+            while True:
+                chunk = cur.fetchmany(self.BATCH)
+                if not chunk:
+                    return
+                for row in chunk:
+                    yield {c: row[i] for i, c in enumerate(cols)}
         finally:
             cur.close()
 
@@ -181,7 +251,7 @@ class SnowflakeAdapter(TargetAdapter):
         )
 
     def execute_medallion(self, cursor: Any, ec: "cg.EntityCode",
-                          rows: list[dict[str, Any]]) -> None:
+                          rows: "Iterable[dict[str, Any]]") -> None:
         """Drive the full medallion against `cursor`, in strict Snowflake sequence:
 
             USE WAREHOUSE  →  CREATE bronze  →  CREATE STAGE  →  PUT rows  →
@@ -210,20 +280,38 @@ class SnowflakeAdapter(TargetAdapter):
         cursor.execute(ec.gold_sql["snowflake"])
 
     def _stage_rows(self, cursor: Any, ec: "cg.EntityCode",
-                    rows: list[dict[str, Any]]) -> str | None:
+                    rows: "Iterable[dict[str, Any]]") -> str | None:
         """Write the wire `rows` to a temp JSON array and PUT it to the Bronze stage.
 
         Returns the temp path (for the caller to unlink) or None when there are no rows.
         The rows are the lossless {column: text|None} wire form; JSON preserves them
         exactly (including JSON-text values destined for VARIANT/ARRAY columns).
+
+        The array is written **incrementally** (SAU-511): previously the whole payload
+        was built as a list and handed to `json.dump`, which meant the live Snowflake
+        path held the entire table in memory twice — once as row dicts, once as the
+        projected payload — before a byte reached disk. Now each row is encoded and
+        written as it arrives, so staging a 10M-row entity costs one row of memory. The
+        emitted bytes are unchanged: the same compact separators, the same key order
+        (`ec.text_columns`), the same single top-level array that STRIP_OUTER_ARRAY
+        expects.
         """
-        if not rows:
-            return None
         cols = ec.text_columns
-        payload = [{c: r.get(c) for c in cols} for r in rows]
+        it = iter(rows)
+        try:
+            first = next(it)
+        except StopIteration:
+            return None                     # no rows — nothing to stage
         fd, path = tempfile.mkstemp(suffix=f".{ec.entity}.json")
         with os.fdopen(fd, "w") as fh:
-            json.dump(payload, fh, ensure_ascii=False, separators=(",", ":"))
+            fh.write("[")
+            fh.write(json.dumps({c: first.get(c) for c in cols},
+                                ensure_ascii=False, separators=(",", ":")))
+            for r in it:
+                fh.write(",")
+                fh.write(json.dumps({c: r.get(c) for c in cols},
+                                    ensure_ascii=False, separators=(",", ":")))
+            fh.write("]")
         # AUTO_COMPRESS off keeps the staged filename stable so COPY INTO can name it.
         cursor.execute(
             f"PUT file://{path} @{self.stage}/{ec.entity}.json "
