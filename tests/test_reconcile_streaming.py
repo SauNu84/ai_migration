@@ -22,6 +22,7 @@ import sys
 import tracemalloc
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from core import codegen as cg
 from core import dialect as dl
@@ -401,6 +402,84 @@ class _ReplayTarget(tg.DuckDbAdapter):
 
     def iter_gold(self, handle, ec):
         return (_plan_row(i) for i in range(self.n))
+
+
+@unittest.skipUnless(PROFILE.exists(), "artifacts/profile.json not generated")
+class TestBatchAndStreamingIssueTheSameQuery(unittest.TestCase):
+    """Both live lanes now build their extraction SQL and argv in one shared place.
+
+    That was a refactor of code with no test on the seam, so this pins it: the streaming
+    reader must issue the SAME query as the materializing reader on both lanes. If the
+    two ever drift, the streamed corpus stops being the corpus the gate validated — a
+    silent extraction difference, which is the one class of defect the §8 gate cannot
+    see (it validates the transform, never the read).
+    """
+
+    def setUp(self):
+        _, self.maps = _plan_code_and_maps()
+
+    def test_postgres_streams_the_same_sql_it_batches(self):
+        d = dl.PostgresDialect()
+        sql = d._extract_sql("plan", self.maps)
+
+        seen = {}
+
+        def fake_run(cmd, **kw):
+            seen["batch"] = cmd
+            class P: returncode = 0; stdout = ""; stderr = ""
+            return P()
+
+        with mock.patch.object(dl.subprocess, "run", fake_run):
+            d.extract_rows("plan", self.maps)
+
+        def fake_popen(cmd, **kw):
+            seen["stream"] = cmd
+            raise RuntimeError("stop")   # argv captured; no need to actually run
+
+        with mock.patch.object(dl.subprocess, "Popen", fake_popen):
+            with self.assertRaises(RuntimeError):
+                list(d.iter_rows("plan", self.maps))
+
+        self.assertIn(sql, seen["batch"])
+        self.assertIn(sql, seen["stream"])
+        # The streaming argv is the batch argv plus the cursor pragma — nothing else.
+        extra = [a for a in seen["stream"] if a not in seen["batch"]]
+        self.assertEqual(extra, [f"FETCH_COUNT={d.FETCH_COUNT}"])
+
+    def test_sqlserver_streams_the_same_argv_it_batches(self):
+        d = dl.SqlServerDialect()
+        sql = d._extract_sql("plan", self.maps)
+        self.assertIn("FOR JSON PATH", sql)
+        self.assertIn("INCLUDE_NULL_VALUES", sql)
+        self.assertIn("ORDER BY [id]", sql)
+
+        seen = {}
+
+        def fake_run(cmd, **kw):
+            seen["batch"] = cmd
+            class P: returncode = 0; stdout = ""; stderr = ""
+            return P()
+
+        with mock.patch.object(dl.subprocess, "run", fake_run):
+            d.extract_rows("plan", self.maps)
+
+        def fake_popen(cmd, **kw):
+            seen["stream"] = cmd
+            raise RuntimeError("stop")
+
+        with mock.patch.object(dl.subprocess, "Popen", fake_popen):
+            with self.assertRaises(RuntimeError):
+                list(d.iter_rows("plan", self.maps))
+
+        # sqlcmd has no cursor pragma to add: the invocations must be byte-identical.
+        self.assertEqual(seen["stream"], seen["batch"])
+        self.assertIn(sql, seen["batch"])
+
+    def test_sqlserver_row_filter_is_shared_by_both_readers(self):
+        d = dl.SqlServerDialect()
+        self.assertTrue(d._is_data_line('{"a": 1}'))
+        for noise in ("Warning: something", "row_json", "---------", ""):
+            self.assertFalse(d._is_data_line(noise), noise)
 
 
 @unittest.skipUnless(PROFILE.exists(), "artifacts/profile.json not generated")
