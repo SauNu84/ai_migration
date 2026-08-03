@@ -174,6 +174,12 @@ def canonicalize(reconcile: str, v: Any, *, source_udt: str = "",
 
 # ── 4. Reconcile ────────────────────────────────────────────────────────────
 
+# Diagnostics are *samples*, not a log: only the first `_DIAG_CAP` mismatching rows are
+# retained per column. The cap is enforced at COLLECTION time, not at construction — see
+# the note on the collection loop in `reconcile_entity` for why that distinction matters.
+_DIAG_CAP = 10
+
+
 @dataclass
 class ColumnResult:
     entity: str
@@ -187,6 +193,9 @@ class ColumnResult:
     mismatches: list[dict[str, Any]] = field(default_factory=list)
     red_flags: list[str] = field(default_factory=list)
     flagged_lossy: bool = False
+    #: total mismatching rows seen, NOT the length of the retained sample. Counted in
+    #: full even after diagnostic collection stops, so capping loses detail, never scale.
+    n_mismatches: int = 0
 
 
 @dataclass
@@ -227,12 +236,23 @@ def reconcile_entity(ec: cg.EntityCode, mappings: list[mp.Mapping],
         tgt_canon = [canonicalize(m.reconcile, r.get(m.column), source_udt=udt, dialect=dialect)
                      for r in target_rows]
         scs, tcs = _checksum(src_canon), _checksum(tgt_canon)
+        # Diagnostics are bounded at COLLECTION time. Appending every mismatching row and
+        # slicing to [:10] only at ColumnResult construction inverted the failure mode: a
+        # clean run cost nothing while a *systematically broken* mapping — precisely what
+        # the gate exists to catch — allocated one dict + one formatted string per row and
+        # OOM'd first. The cheap path stayed cheap and the diagnostic path exploded. The
+        # retained content is unchanged (the slice already kept the first 10); only the
+        # rows past the cap are no longer built. `n_mismatches` keeps the full scale.
         mismatches: list[dict[str, Any]] = []
         red: list[str] = []
+        n_mismatch = 0
         for i in range(n):
             sv, tv = src_canon[i], tgt_canon[i]
             if sv == tv:
                 continue
+            n_mismatch += 1
+            if len(mismatches) >= _DIAG_CAP:
+                continue  # keep counting, stop allocating
             mismatches.append({"row": i, "source": sv, "target": tv})
             # red-flag classification
             if sv is not None and tv is None:
@@ -259,9 +279,10 @@ def reconcile_entity(ec: cg.EntityCode, mappings: list[mp.Mapping],
                 target_checksum=tcs,
                 match=match,
                 n_compared=n,
-                mismatches=mismatches[:10],
-                red_flags=red[:10],
+                mismatches=mismatches,
+                red_flags=red,
                 flagged_lossy=("lossy_float" in m.flags),
+                n_mismatches=n_mismatch,
             )
         )
     return EntityResult(
