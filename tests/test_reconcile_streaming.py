@@ -216,6 +216,29 @@ class TestFailureIsNotMasked(unittest.TestCase):
             rc.run({"plan": self.ec}, self.maps, self.udt, dialect=_ExplodingDialect())
         self.assertIn("source connection dropped", str(ctx.exception))
 
+    def test_an_uncanonicalizable_value_is_a_caught_defect_not_a_source_failure(self):
+        """The ablation run's whole job is to force values the mapping cannot handle.
+
+        Regression: `_tee` originally tagged *both* halves of the tee as
+        `SourceReadError`, so a value the mapping could not canonicalize aborted the
+        entire gate instead of being recorded as the caught defect it is. Caught on the
+        live SQL Server lane, where the naive mapper forces `audit_trail.row_version`
+        (a ROWVERSION, wire form `'0x0000000000002715'`) to `TIMESTAMP_NTZ`. Reproduced
+        here in the same shape: a timestamp strategy pointed at a non-timestamp column.
+        The source read itself is perfectly healthy.
+        """
+        naive = [mp.Mapping(**vars(m)) for m in self.maps]   # copy: don't mutate setUp's
+        price = next(m for m in naive if m.column == "monthly_price")
+        price.reconcile = mp.RC_TS_WALL
+
+        res = rc.run({"plan": self.ec}, naive, self.udt,
+                     dialect=_StreamingDialect(10))[0]
+
+        self.assertIsNotNone(res.exec_error)              # caught, not raised
+        self.assertNotIn("SourceReadError", res.exec_error)
+        self.assertIn("Invalid isoformat", res.exec_error)
+        self.assertFalse(res.row_match)
+
     def test_a_genuine_transform_failure_is_still_recorded_as_exec_error(self):
         """The other side of the same coin: target failures stay caught, not raised."""
         class _BrokenTarget(tg.DuckDbAdapter):

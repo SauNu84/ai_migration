@@ -560,7 +560,7 @@ def semantic_guard(prop, m: mp.Mapping,
 
 
 class SourceReadError(Exception):
-    """A failure originating in the SOURCE read (or its canonicalization), not the target.
+    """A failure DELIVERING a source row — the extraction itself, not the mapping.
 
     Streaming puts the source walk *inside* the target's execution call — the rows are
     pulled lazily by the Bronze load. Without this marker the `except Exception` that
@@ -569,6 +569,15 @@ class SourceReadError(Exception):
     earn, and a genuinely broken source read would look like a successful detection.
     That is the masking failure mode §8 exists to forbid, so source failures are tagged
     here and deliberately re-raised.
+
+    Scope is deliberately narrow: **only pulling the next row** counts. Folding a row
+    into the source digest canonicalizes it under the mapping being tested, and a value
+    the mapping cannot canonicalize is a *mapping* defect — exactly what the ablation
+    run exists to provoke — so it must stay an ordinary exception the target's
+    `except Exception` records as a caught defect. Tagging it here instead aborted the
+    whole gate on the SQL Server lane's ROWVERSION trap (`audit_trail.row_version`
+    forced to `TIMESTAMP_NTZ`: `'0x0000000000002715'` is not an ISO-8601 string). See
+    `_tee`.
     """
 
 
@@ -609,17 +618,29 @@ def _tee(rows: Iterable[dict[str, Any]],
          sink: "Callable[[dict[str, Any]], None]") -> Iterator[dict[str, Any]]:
     """Yield each row after handing it to `sink` — one walk, two consumers.
 
-    Failures on either side of the tee are the SOURCE's, so they are tagged as such and
-    kept distinguishable from a target/transform failure. `BaseException` (notably the
-    `SystemExit` a failed psql/sqlcmd raises) is left alone — it already bypasses the
-    target's `except Exception`.
+    The two halves fail for different reasons and must be classified differently:
+
+    * **Pulling** the row is the source read. A failure there means the source never
+      delivered, and recording it as a caught transform defect would be a detection the
+      gate did not earn — so it is tagged `SourceReadError` and re-raised.
+    * **`sink(r)`** folds the row into the source digest, which canonicalizes it under
+      the mapping under test. A failure there is a *mapping* defect (the ablation run
+      forces exactly these), so it propagates untagged and the target's
+      `except Exception` records it as the caught defect it is.
+
+    `BaseException` (notably the `SystemExit` a failed psql/sqlcmd raises) is left alone
+    on both halves — it already bypasses the target's `except Exception`.
     """
-    try:
-        for r in rows:
-            sink(r)
-            yield r
-    except Exception as exc:
-        raise SourceReadError(f"{type(exc).__name__}: {exc}") from exc
+    it = iter(rows)
+    while True:
+        try:
+            r = next(it)
+        except StopIteration:
+            return
+        except Exception as exc:
+            raise SourceReadError(f"{type(exc).__name__}: {exc}") from exc
+        sink(r)
+        yield r
 
 
 def run(code: dict[str, cg.EntityCode], mappings: list[mp.Mapping],
