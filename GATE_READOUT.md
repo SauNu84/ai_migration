@@ -32,6 +32,8 @@ The pairs below did **not** match byte-for-byte. Each was reconciled by a rule t
 | audit_log.ip_address | `::1` | `::1/128` | `inet_host_mask` |
 | audit_log.ip_address | `2001:db8::8a2e:370:7334` | `2001:db8::8a2e:370:7334/128` | `inet_host_mask` |
 
+Read the direction, not just the rows. Each rule is consulted only on residuals the exact comparison left over, and only the way the type documents — the seed abbreviates, the type expands. The inverse, an extraction that **strips** what the type stores, would make every abbreviated literal match exactly and empty this table: a strictly greener readout produced by a lossy write policy. So the corpus deliberately also seeds values no equivalence can reach (ADR-0001, SAU-518) — those rows match byte-for-byte here and fail loudly the moment extraction starts discarding.
+
 ## 1 · Reconciliation runs
 
 - Run 1: 16 entities, 123 columns — clean
@@ -46,7 +48,7 @@ The pairs below did **not** match byte-for-byte. Each was reconciled by a rule t
 ### 2b · Frozen-ontology regeneration (SAU-312 / CTO item ②)
 
 - Bullet 2 above re-lifts from the profile, which is byte-identical only because inference is a deterministic heuristic today. The real guarantee is this: the **approved ontology is frozen to a content-addressed artifact**, and regeneration loads that artifact and re-maps + re-codegens — the inference seam is never re-entered. The guarantee therefore survives an LLM entering inference.
-- Frozen-artifact SHA-256: `772c77b2b5167a38c1c4138399128421df6b815a176e25ccfaff9344fe27f9bc`
+- Frozen-artifact SHA-256: `624eec00c8f3d1f7ad508350ad48eda12ed5e571cfe142061f8b5f9b82bd8c9b`
 - 5 regenerations from the frozen artifact → 1 distinct digest(s); matches the live generation: True.
 - Inference re-entered on the regen path: **False** (enforced by `assert_no_inference`).
 - Tampered-frozen-artifact rejected by integrity check: True.

@@ -77,6 +77,26 @@ class TestPostgresPhysicalTokenTable(unittest.TestCase):
         self.assertEqual(self.d.extraction_expr("doc", mp.RC_JSON_CANONICAL), '"doc"::text')
         self.assertIn("json_agg", self.d.extraction_expr("tags", mp.RC_ARRAY_CANONICAL))
 
+    def test_network_extraction_is_the_canonical_text_cast_not_a_mask_strip(self):
+        """ADR-0001 pinned at the *extraction* expression (SAU-518).
+
+        SAU-516 pinned the equivalence RULE; nothing pinned the expression that produces
+        the value the rule is applied to. `inet::text` is the type's canonical output
+        form and keeps the mask (`203.0.113.42/32`, `10.0.0.0/24`). `host()` and
+        `abbrev()` both drop it — `host(inet '10.0.0.0/24')` is `10.0.0.0`, a different
+        network — and ADR-0001 ruled the strip is the irreversible direction.
+
+        This is the DB-free half. The half that actually watches the wire is
+        `test_corpus.TestCommittedPostgresLane`, and the corpus tripwire is the
+        `10.0.0.0/24` seed row: with only host addresses seeded, a mask-stripping
+        extraction matches every bare literal exactly and the gate goes *greener*.
+        """
+        expr = self.d.extraction_expr("ip_address", mp.RC_EXACT_TEXT)
+        self.assertEqual(expr, '"ip_address"::text')
+        for stripper in ("host(", "abbrev(", "masklen(", "network(", "set_masklen("):
+            self.assertNotIn(stripper, expr.lower(),
+                             f"{stripper} discards the mask ADR-0001 ruled canonical")
+
 
 class TestDialectIsPluggable(unittest.TestCase):
     def test_default_lane_is_postgres(self):

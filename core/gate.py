@@ -526,6 +526,19 @@ def write_readout(gate: GateResult, out_path: str | Path, *,
             for e in b0["equivalences"]:
                 A(f"| {e['column']} | `{e['claimed']}` | `{e['stored']}` | "
                   f"`{e['rule']}` |")
+            # SAU-518. Without this, a reader can verify each rule above but not the one
+            # thing the table structurally cannot show: that it is non-empty for a
+            # reason. An emptier table is the *worse* outcome here, and nothing else in
+            # the readout says so.
+            A("\nRead the direction, not just the rows. Each rule is consulted only on "
+              "residuals the exact comparison left over, and only the way the type "
+              "documents — the seed abbreviates, the type expands. The inverse, an "
+              "extraction that **strips** what the type stores, would make every "
+              "abbreviated literal match exactly and empty this table: a strictly "
+              "greener readout produced by a lossy write policy. So the corpus "
+              "deliberately also seeds values no equivalence can reach (ADR-0001, "
+              "SAU-518) — those rows match byte-for-byte here and fail loudly the "
+              "moment extraction starts discarding.")
 
         if b0.get("not_seed_declarable"):
             A("\n### Not seed-declarable (counted separately — NOT a pass)\n")

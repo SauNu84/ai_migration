@@ -101,11 +101,24 @@ INSERT INTO support_ticket (org_id, user_id, priority, subject, body, sentiment,
   (3, 5, 'low',    'Feature request: 日本語', 'Please add full JP localization.',     0.80, TIMESTAMPTZ '2024-03-05 01:00:00+00', NULL);
 
 -- audit log — inet + nullable actor + JSON payload
+--
+-- The first four rows are HOST addresses, written bare. The type stores them with the
+-- full host mask (`203.0.113.42/32`), so seed and storage differ by a documented
+-- equivalence (`inet_host_mask`, SAU-516) — that difference is what keeps the extraction
+-- honest, and it must never be normalized away in either direction (ADR-0001).
+--
+-- The fifth row is a genuine NETWORK. Its canonical text is `10.0.0.0/24`, which equals
+-- no host-mask form of any address, so it matches the seed literal EXACTLY and needs no
+-- equivalence. It is the tripwire on the extraction expression (SAU-518): a mask-stripping
+-- extraction (`host()`) would render it `10.0.0.0`, matching nothing — whereas the four
+-- host rows would still match their bare literals exactly and the gate would go GREENER.
+-- Do not remove this row, and do not narrow its mask to /32.
 INSERT INTO audit_log (actor_user_id, action, entity_type, entity_id, ip_address, payload, occurred_at) VALUES
   (1,    'user.login',     'app_user', 1, '203.0.113.42',        '{"ua":"Mozilla/5.0","mfa":true}',            TIMESTAMPTZ '2024-03-01 08:15:00+00'),
   (2,    'invoice.paid',   'invoice',  1, '198.51.100.7',        '{"amount_cents":2499000000}',                TIMESTAMPTZ '2024-01-05 14:22:01+00'),
   (NULL, 'system.cron',    'job',      0, '::1',                 '{"job":"nightly_rollup","ok":true}',         TIMESTAMPTZ '2024-03-06 03:00:00+00'),  -- IPv6 + null actor
-  (4,    'token.created',  'api_token', 1, '2001:db8::8a2e:370:7334', '{"scopes":["read"]}',                  TIMESTAMPTZ '2024-03-02 09:00:00+00'); -- full IPv6
+  (4,    'token.created',  'api_token', 1, '2001:db8::8a2e:370:7334', '{"scopes":["read"]}',                  TIMESTAMPTZ '2024-03-02 09:00:00+00'), -- full IPv6
+  (1,    'acl.range_added', 'org',     1, '10.0.0.0/24',         '{"scope":"vpn","rule":"allow"}',             TIMESTAMPTZ '2024-03-07 11:30:00+00'); -- CIDR network, not a host
 
 -- event metrics — double precision values
 INSERT INTO event_metric (org_id, metric_name, value, dimensions, recorded_at) VALUES

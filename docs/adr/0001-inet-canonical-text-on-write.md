@@ -67,17 +67,35 @@ rejected on grounds 1 and 2 — being safe is not the same as being warranted.
 - The `canonical_text_differs_from_input` flag is now the *contract*, not a caveat.
   Phase 1 target DDL should carry a normalized view or derived column for consumers who
   need the application-input form; that belongs to the target design, not the chassis.
-- **This ruling is currently unenforceable, and that is a real gap.** Every `inet` row in
-  `schema/02_seed.sql` is a bare host address (`203.0.113.42`, `198.51.100.7`, `::1`,
-  `2001:db8::8a2e:370:7334`). Under a strip-on-write extraction, all four would match
-  their seed literals *exactly*; `corpus.py` resolves equivalences only over the residual
-  after the exact multiset diff, so the residual would be empty and gate bullet 0 would
-  report zero missing, zero unclaimed, and zero equivalence applications — a **strictly
-  greener** readout than today's, while the chassis silently acquired a lossy write
-  policy. The manifest's `assert` string ("canonical text form preserved") is prose:
-  `test_profile.py` checks only that the key exists. The unit tests in `test_dialect.py`
-  and `test_corpus.py` pin the *equivalence rule* against `/24` cases, but nothing pins
-  the *extraction*. Tracked as a follow-up.
+- **This ruling was unenforceable when the ADR was written. SAU-518 closed that gap.**
+  The gap, recorded as it stood: every `inet` row in `schema/02_seed.sql` was a bare host
+  address (`203.0.113.42`, `198.51.100.7`, `::1`, `2001:db8::8a2e:370:7334`). Under a
+  strip-on-write extraction, all four would match their seed literals *exactly*;
+  `corpus.py` resolves equivalences only over the residual after the exact multiset diff,
+  so the residual would be empty and gate bullet 0 would report zero missing, zero
+  unclaimed, and zero equivalence applications — a **strictly greener** readout than
+  today's, while the chassis silently acquired a lossy write policy. The manifest's
+  `assert` string ("canonical text form preserved") is prose: `test_profile.py` checks
+  only that the key exists. The unit tests pinned the *equivalence rule* against `/24`
+  cases, but nothing pinned the *extraction*.
+
+  What closed it, in the order the defect would have to get past:
+  1. `schema/02_seed.sql` seeds a genuine network, `10.0.0.0/24`, whose canonical text
+     equals no host-mask form. It matches the seed literal exactly and needs no
+     equivalence — so a mask strip renders it `10.0.0.0`, matching nothing, and bullet 0
+     goes RED. This is the tripwire the four host rows structurally could not be.
+  2. `test_corpus.py` runs the strip as a live ablation and asserts **both** halves: that
+     it is caught, *and* that all four host rows stay green under it — the counterfactual
+     that makes the `/24` load-bearing rather than decorative.
+  3. `test_dialect.py` pins the extraction expression itself to the canonical-text cast.
+  4. The bullet-0 readout now states the direction, so an *emptier* equivalence table
+     reads as the warning it is rather than as a cleaner result.
+
+  Note what did **not** change: no strip-on-write normalization was implemented, and no
+  seed literal was edited toward the engine's output form. The four host rows still claim
+  the bare address and still reconcile by the named rule. Adding a `/24` is not the
+  rejected option (a): a `/24` is not a form the engine canonicalized us into, it is a
+  different value whose mask carries information no host address has.
 
 ## Alternatives considered
 

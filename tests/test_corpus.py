@@ -24,6 +24,7 @@ Run:
 """
 from __future__ import annotations
 
+import ipaddress
 import json
 import subprocess
 import unittest
@@ -50,6 +51,22 @@ def _pg_reachable() -> bool:
         return p.returncode == 0 and p.stdout.strip() == "1"
     except Exception:
         return False
+
+
+class _MaskStrippingDialect(dl.PostgresDialect):
+    """The ADR-0001 strip, as an ablation: extraction that discards the `inet` mask.
+
+    `host(inet '203.0.113.42/32')` → `203.0.113.42`; `host(inet '10.0.0.0/24')` →
+    `10.0.0.0`. This is the exact edit SAU-518 exists to make detectable, applied to the
+    live source so the detection is proved rather than argued.
+    """
+
+    name = "postgres-mask-strip"
+
+    def extraction_expr(self, column: str, reconcile: str) -> str:
+        if column == "ip_address":
+            return f'host("{column}")'
+        return super().extraction_expr(column, reconcile)
 
 
 class _StubDialect(dl.PostgresDialect):
@@ -492,16 +509,84 @@ class TestCommittedPostgresLane(unittest.TestCase):
     def test_the_seed_was_not_edited_to_match_the_engine(self):
         """The rejected option (a), pinned so it cannot arrive later by accident.
 
-        Normalizing the seed literal to `/32` would transcribe the engine's output back
+        Normalizing a HOST literal to `/32` would transcribe the engine's output back
         into the claim — destroying the seed's independence, which is bullet 0's only
         load-bearing property, and leaving a tautology that reports GREEN.
+
+        The `10.0.0.0/24` row (SAU-518) is emphatically not that, and the distinction is
+        the point. A /24 is not a form the engine canonicalized us into; it is a
+        different *value*, whose mask carries information no host address has — drop it
+        and the row names a different network. So the guard is not "no slashes"; it is
+        "no host address ever acquires a mask, and no masked literal is a host mask".
         """
         claims = cp.seed_claims(SEED, read="postgres")
         vals = [cp._literal_text(v) for v in claims[("audit_log", "ip_address")]]
         self.assertEqual(vals, ["203.0.113.42", "198.51.100.7", "::1",
-                                "2001:db8::8a2e:370:7334"])
-        for v in vals:
-            self.assertNotIn("/", v, "the seed must state the bare address it always did")
+                                "2001:db8::8a2e:370:7334", "10.0.0.0/24"])
+
+        masked = [v for v in vals if "/" in v]
+        self.assertTrue(masked, "the seed must carry at least one genuine network, or a "
+                                "mask-stripping extraction matches every literal exactly")
+        for v in masked:
+            net = ipaddress.ip_network(v, strict=False)
+            self.assertNotEqual(
+                net.prefixlen, net.max_prefixlen,
+                f"{v} is a host mask — that literal IS the engine's own output form, "
+                f"which is the transcription this test exists to forbid")
+
+    def test_the_network_row_is_the_tripwire_on_the_extraction_expression(self):
+        """SAU-518: what the four host rows structurally cannot catch.
+
+        A mask-stripping extraction (`host()`) leaves all four host rows matching their
+        bare seed literals EXACTLY — so `missing`, `unclaimed` and the equivalence count
+        all drop to zero and the readout gets strictly *greener* while the chassis
+        acquires a lossy write policy. The `/24` is the row that cannot be faked: its
+        canonical text equals no host-mask form, so it is reconciled by the exact
+        comparison, and stripping it to `10.0.0.0` matches nothing.
+        """
+        a = next(x for x in self._audits()
+                 if f"{x.entity}.{x.column}" == "audit_log.ip_address")
+        self.assertEqual(a.verdict, cp.V_VERIFIED)
+        # the wire form itself: the engine's canonical text, mask intact
+        self.assertIn("10.0.0.0/24", a.stored)
+        self.assertIn("203.0.113.42/32", a.stored)
+        # ...and it needed no equivalence to get there — exact match, both sides
+        self.assertNotIn("10.0.0.0/24", [e["claimed"] for e in a.equivalences],
+                         "the network row must reconcile exactly, never by a rule")
+        self.assertEqual(len(a.equivalences), 4,
+                         "exactly the four host rows use inet_host_mask")
+
+    def test_a_mask_stripping_extraction_is_caught_and_only_the_network_row_catches_it(self):
+        """The ablation. Both halves matter, and the second is the one SAU-518 is about.
+
+        Half 1 — the strip is caught: bullet 0 goes DRIFTED with `10.0.0.0/24` claimed
+        and never stored.
+
+        Half 2 — nothing else catches it. Every one of the four HOST rows still matches
+        its bare seed literal byte-for-byte under the strip, so each drops out of the
+        exact comparison clean and never even reaches the equivalence pass. Had the
+        corpus held only host addresses, this ablation would report 0 missing, 0
+        unclaimed and 0 equivalences — greener than the honest lane, which is precisely
+        why a passing gate could not previously distinguish canonical-on-write from
+        strip-on-write.
+        """
+        stripped = cp.audit_corpus(self.hard, SEED, self.maps, self.udt,
+                                   dialect=_MaskStrippingDialect(), col_facts=self.facts)
+        a = next(x for x in stripped
+                 if f"{x.entity}.{x.column}" == "audit_log.ip_address")
+
+        self.assertEqual(a.verdict, cp.V_DRIFTED, "a mask strip must fail bullet 0")
+        self.assertEqual(a.missing, ["10.0.0.0/24"])
+        self.assertEqual(a.unclaimed, ["10.0.0.0"])
+
+        # the load-bearing half: the host rows are blind to it
+        hosts = ["203.0.113.42", "198.51.100.7", "::1", "2001:db8::8a2e:370:7334"]
+        for h in hosts:
+            self.assertIn(h, a.stored, f"{h} is stored bare under the strip")
+            self.assertNotIn(h, a.missing, f"{h} still matches its literal exactly")
+        self.assertEqual(a.equivalences, [],
+                         "under the strip no host row is even a residual — the "
+                         "equivalence table empties, and an empty table reads as clean")
 
 
 if __name__ == "__main__":
