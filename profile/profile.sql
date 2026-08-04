@@ -59,7 +59,14 @@ BEGIN
 
     FOR c IN
       SELECT column_name, ordinal_position, data_type, udt_name, is_nullable,
-             character_maximum_length, numeric_precision, numeric_scale
+             character_maximum_length, numeric_precision, numeric_scale,
+             -- Generation facts (SAU-516). Emitted as three SEPARATE catalog facts, not
+             -- collapsed into one is_generated boolean: they mean different things and
+             -- the dialect treats them differently (a computed column cannot be named by
+             -- an INSERT; a DEFAULT-ed one can, and this seed simply did not). Collapsing
+             -- them here would bake that judgement into the projection, where the layer
+             -- that owns the type can no longer revisit it.
+             is_identity, identity_generation, is_generated, column_default
       FROM information_schema.columns
       WHERE table_schema = target_schema AND table_name = t.table_name
       ORDER BY ordinal_position
@@ -100,6 +107,11 @@ BEGIN
         'char_max_len',      c.character_maximum_length,
         'numeric_precision', c.numeric_precision,
         'numeric_scale',     c.numeric_scale,
+        'is_identity',       (c.is_identity = 'YES'),
+        'identity_generation', c.identity_generation,
+        -- GENERATED ALWAYS AS (…) STORED — no INSERT may supply a value.
+        'is_computed',       (c.is_generated = 'ALWAYS'),
+        'has_default',       (c.column_default IS NOT NULL),
         'null_count',        (col_stats->>'null_count')::bigint,
         'null_rate',         CASE WHEN row_count > 0 AND col_stats ? 'null_count'
                                   THEN round(((col_stats->>'null_count')::numeric / row_count), 6)

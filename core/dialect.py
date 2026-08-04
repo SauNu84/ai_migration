@@ -56,6 +56,26 @@ PT_BINARY = "binary"                  # raw bytes / row-version counter (NOT a t
 PT_UNKNOWN = "unknown"
 
 
+# ── Named type equivalences (SAU-516, decision 1) ───────────────────────────
+# A *documented* equivalence between the form a seed literal is written in and the form
+# the source type canonically stores, declared by the dialect that owns the type.
+#
+# The line between one of these and an answer key is a single question, and it is the
+# reason each one carries a name:
+#
+#   **Would the rule have been written the same way BEFORE we saw this failure?**
+#
+# `inet` passes it: "an omitted mask means the full host mask" is documented PostgreSQL
+# type semantics, derivable from the type alone without ever looking at our corpus. A
+# rule that can only be justified by pointing at an observed output fails it, and is a
+# seed edit wearing a lab coat — reject it on sight.
+#
+# Every application is reported with BOTH raw forms and the rule's name (gate bullet 0's
+# readout). An equivalence that hid its own application would be the invisible-
+# normalization defect one layer up — exactly what bullet 0 was written to catch.
+EQ_INET_HOST_MASK = "inet_host_mask"
+
+
 class SourceDialect(ABC):
     """The source-half of one migration lane. Implementations are stateless."""
 
@@ -112,6 +132,46 @@ class SourceDialect(ABC):
     @abstractmethod
     def is_narrow_float(self, source_udt: str) -> bool:
         """Whether `source_udt` is a single-width binary float (lossier reconcile epsilon)."""
+
+    # ── Seam 5: corpus-audit type facts (SAU-516) ───────────────────────────
+    # Both hooks exist so gate bullet 0 stays type-agnostic. The moment the audit's
+    # comparator learns a type name it becomes the answer key it was written to detect,
+    # so every type-specific judgement is asked of the dialect that owns the type.
+
+    def claim_equivalence(self, claimed: str | None, stored: str | None, *,
+                          source_udt: str = "", data_type: str = "") -> str | None:
+        """Name of the documented type equivalence under which a seed's `claimed`
+        literal and the extracted `stored` text denote the same value — or None.
+
+        Default: **None**. A lane declares its equivalences explicitly; an equivalence
+        that arrived by inheritance is one nobody wrote down, and an undocumented
+        equivalence is indistinguishable from silently accepting drift.
+        """
+        return None
+
+    def is_seed_declarable(self, facts: dict[str, Any]) -> bool:
+        """Whether an INSERT in this source *can* name this column and state a value.
+
+        `facts` are catalog facts from the profile projection: `data_type`, `udt`,
+        `is_identity`, `is_computed`, `has_default`.
+
+        This is the discriminator behind bullet 0's third state. The seed cannot tell
+        "the trap was never planted" from "the type forbids planting it" — but the
+        *catalog* can, because being engine-generated is a property of the type, not an
+        observation about our corpus. That is what makes the exemption unabusable: it
+        cannot be widened by appending to a list, only by lying about a type.
+
+        Default: everything is declarable except a computed column. **Fails closed** —
+        a column whose facts are unknown is treated as declarable, so a genuinely
+        unplanted trap still fails rather than being exempted by omission.
+
+        Note what is deliberately NOT here: a DEFAULT. A defaulted column is one an
+        INSERT *may* name and this seed did not — the "normal column the seed forgot"
+        case, which must keep failing. Row-level DEFAULTs are already handled honestly
+        one level down, as an announced weakening of the comparison ("subset (N rows
+        took a DEFAULT)"), not as an exemption.
+        """
+        return not bool(facts.get("is_computed"))
 
 
 # ── PostgresDialect — the first implementation (SAU-303/305 behavior, verbatim) ──
@@ -301,6 +361,30 @@ class PostgresDialect(SourceDialect):
     def is_narrow_float(self, source_udt: str) -> bool:
         return (source_udt or "").lower() in ("float4", "real")
 
+    # ── Seam 5 ──
+    def claim_equivalence(self, claimed: str | None, stored: str | None, *,
+                          source_udt: str = "", data_type: str = "") -> str | None:
+        """`inet`/`cidr`: an omitted mask denotes the full host mask (SAU-516).
+
+        `inet '203.0.113.42'` and `inet '203.0.113.42/32'` are the same value under the
+        type's own equality operator — round-trip stable, nothing lost. The seed writes
+        the abbreviated input grammar; the type stores its canonical output form.
+
+        The scope is deliberately the narrowest that covers that: the claim must omit
+        the mask **entirely**, and the stored form must carry **exactly** the full host
+        mask (/32 IPv4, /128 IPv6). Every other mask difference stays a finding — a
+        blanket strip-the-mask rule would also swallow `/24 → /32`, which is real data
+        loss, trading a genuine hole in gate coverage for cosmetics.
+        """
+        if claimed is None or stored is None:
+            return None
+        if self.physical_token(data_type, source_udt) != PT_NETWORK:
+            return None
+        if "/" in claimed:                 # the claim states a mask — compare it verbatim
+            return None
+        host_mask = "/128" if ":" in claimed else "/32"     # IPv6 vs IPv4
+        return EQ_INET_HOST_MASK if stored == claimed + host_mask else None
+
 
 # ── SqlServerDialect — the second lane (SAU-324, against the SAU-323 seed) ───────
 #
@@ -323,6 +407,11 @@ _MS_MONEY = ("money", "smallmoney")
 _MS_TS_NTZ = ("datetime", "datetime2", "smalldatetime")          # no time zone
 _MS_TS_TZ = ("datetimeoffset",)                                  # tz-aware instant
 _MS_BINARY = ("binary", "varbinary", "image", "timestamp", "rowversion")
+#: The engine-assigned subset of _MS_BINARY. A ROWVERSION counter is written by the
+#: server on every INSERT/UPDATE and cannot be supplied by one — unlike plain
+#: BINARY/VARBINARY, which a seed names like any other column. Same catalog signal that
+#: already drives the BINARY(8) mapping, read for a second, narrower question.
+_MS_ROWVERSION = ("timestamp", "rowversion")
 _MS_FLOAT_WIDE = ("float",)                                      # FLOAT(53) ≈ double
 _MS_FLOAT_NARROW = ("real",)                                     # REAL ≈ float4
 _MS_NUMERIC = ("decimal", "numeric")
@@ -387,9 +476,28 @@ class SqlServerDialect(SourceDialect):
         return proc.stdout
 
     def run_profiler(self, schema: str = "dbo") -> str:
-        """Install the profiler proc then invoke it; return the raw aggregate JSON."""
+        """Install the profiler proc then invoke it; return the raw aggregate JSON.
+
+        The proc emits exactly one JSON document, but its per-column statistics run
+        `COUNT(DISTINCT …)`/`MIN`/`MAX` over nullable columns, and this rig's sqlcmd
+        prints SQL Server's "Null value is eliminated by an aggregate" note to *stdout*,
+        ahead of the document. Those are informational: `-b` makes a real error a
+        non-zero exit, which `_sqlcmd` already raises on, so selecting the document here
+        cannot swallow a failure — the same reason `_is_data_line` filters the
+        extraction stream.
+
+        A missing document raises, carrying the output. Returning a truncated or empty
+        profile would push a *reader* failure downstream disguised as a thin schema —
+        the misattribution SAU-513's unparsed-INSERT guard exists to prevent.
+        """
         self._sqlcmd(self.profiler_install_sql(), context="sqlcmd install")
-        return self._sqlcmd(self.profile_query(schema), context="sqlcmd profile").strip()
+        out = self._sqlcmd(self.profile_query(schema), context="sqlcmd profile")
+        for line in out.splitlines():
+            if line.strip().startswith("{"):
+                return line.strip()
+        raise SystemExit(
+            "sqlcmd profile returned no JSON document; sqlcmd said: "
+            f"{out.strip()[:500] or '(nothing)'}")
 
     # ── Seam 2: extraction-expr builder (the lossless wire form) ─────────────
     def _wire_expr(self, column: str, source_type: str, reconcile: str) -> str:
@@ -549,6 +657,24 @@ class SqlServerDialect(SourceDialect):
 
     def is_narrow_float(self, source_udt: str) -> bool:
         return (source_udt or "").lower() in ("real", "float4")
+
+    # ── Seam 5 ──
+    def is_seed_declarable(self, facts: dict[str, Any]) -> bool:
+        """ROWVERSION is engine-assigned, so no INSERT can state a claim about it.
+
+        This is a schema fact, not an observation about our seed: the server writes the
+        8-byte counter itself on every INSERT/UPDATE, and naming the column in an INSERT
+        is an error. The audit's third state is therefore *derived from the type*, and a
+        normal column the seed forgot still fails — the dialect reports it declarable.
+
+        IDENTITY is deliberately **not** exempt here: `SET IDENTITY_INSERT` lets an
+        INSERT name it, this lane's seed does exactly that, and `company.id` is verified
+        by bullet 0 today. An exemption for something that is in fact declarable is the
+        list-that-rots failure mode with extra steps.
+        """
+        if not super().is_seed_declarable(facts):
+            return False
+        return (facts.get("data_type") or "").lower() not in _MS_ROWVERSION
 
 
 # Default lane until a run selects another. The whole loop is Postgres today; this keeps

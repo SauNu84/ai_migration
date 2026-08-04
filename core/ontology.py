@@ -130,6 +130,15 @@ class Property:
     distinct_count: int | None
     min: str | None
     max: str | None
+    # generation facts (SAU-516) — physical catalog facts, the same class as `nullable`.
+    # Deliberately three facts rather than one `is_generated` flag: they mean different
+    # things, and the dialect turns them into a declarability verdict differently for
+    # each (IDENTITY is nameable under SET IDENTITY_INSERT; a computed column never is;
+    # a DEFAULT-ed one is nameable and simply was not named). Defaulted to False so a
+    # profile written before SAU-516 still loads, reading as "ordinary column".
+    is_identity: bool = False
+    is_computed: bool = False
+    has_default: bool = False
     # inferred semantics (the isolated AI pass)
     semantic_type: str = SEM_FREE_TEXT
     confidence: float = 0.0
@@ -477,6 +486,9 @@ def lift(profile: dict[str, Any], dialect: "dl.SourceDialect | None" = None) -> 
                     distinct_count=c.get("distinct_count"),
                     min=c.get("min"),
                     max=c.get("max"),
+                    is_identity=bool(c.get("is_identity", False)),
+                    is_computed=bool(c.get("is_computed", False)),
+                    has_default=bool(c.get("has_default", False)),
                     semantic_type=sem,
                     confidence=round(conf, 4),
                     governance_tags=tags,
@@ -601,6 +613,9 @@ def ontology_from_json(doc: dict[str, Any]) -> Ontology:
                     distinct_count=p.get("distinct_count"),
                     min=p.get("min"),
                     max=p.get("max"),
+                    is_identity=bool(p.get("is_identity", False)),
+                    is_computed=bool(p.get("is_computed", False)),
+                    has_default=bool(p.get("has_default", False)),
                     semantic_type=p.get("semantic_type", SEM_FREE_TEXT),
                     confidence=p.get("confidence", 0.0),
                     governance_tags=list(p.get("governance_tags", [])),

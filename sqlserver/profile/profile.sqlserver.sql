@@ -7,7 +7,8 @@
 --   { schema, database, profiler_version, table_count, fk_count, tables:[...],
 --     foreign_keys:[{table,column,ref_table,ref_column,constraint}] }
 -- and each column carries: name, ordinal, data_type, udt, nullable, char_max_len,
--- numeric_precision, numeric_scale, null_count, null_rate, distinct_count, min, max.
+-- numeric_precision, numeric_scale, is_identity, is_computed, has_default, null_count,
+-- null_rate, distinct_count, min, max.
 --
 -- ALL statistics are computed IN-DATABASE via dynamic SQL (counts, distincts, min/max
 -- as text) — never raw rows; only the compact JSON leaves the server (no data egress).
@@ -46,6 +47,14 @@ BEGIN
         numeric_scale     int      NULL,
         datetime_precision int     NULL,
         nullable          bit,
+        -- Generation facts (SAU-516): three SEPARATE catalog facts, deliberately not
+        -- collapsed into one is_generated boolean. IDENTITY is nameable under
+        -- SET IDENTITY_INSERT (this lane's seed does exactly that), a computed column
+        -- never is, and a DEFAULT-ed one is nameable and simply was not named. Only the
+        -- dialect gets to turn these into a declarability verdict.
+        is_identity       bit      NOT NULL DEFAULT 0,
+        is_computed       bit      NOT NULL DEFAULT 0,
+        has_default       bit      NOT NULL DEFAULT 0,
         null_count        bigint   NULL,
         distinct_count    bigint   NULL,
         min_val           nvarchar(max) NULL,
@@ -54,7 +63,8 @@ BEGIN
 
     -- Seed the metadata rows from INFORMATION_SCHEMA, applying the three normalisations.
     INSERT INTO #cols (table_name, column_name, ordinal, data_type, udt, char_max_len,
-                       numeric_precision, numeric_scale, datetime_precision, nullable)
+                       numeric_precision, numeric_scale, datetime_precision, nullable,
+                       is_identity, is_computed, has_default)
     SELECT
         c.TABLE_NAME,
         c.COLUMN_NAME,
@@ -87,7 +97,21 @@ BEGIN
         -- (DATETIME2(7) → 7, legacy DATETIME → 3). Pins the Snowflake TIMESTAMP_*(p) so
         -- the target type asserts the exact precision, not just the family.
         c.DATETIME_PRECISION,
-        CASE WHEN c.IS_NULLABLE = 'YES' THEN 1 ELSE 0 END
+        CASE WHEN c.IS_NULLABLE = 'YES' THEN 1 ELSE 0 END,
+        -- IsIdentity: nameable under SET IDENTITY_INSERT, so this is a fact, not an
+        -- exemption. COLUMNPROPERTY returns NULL for a name it cannot resolve — ISNULL
+        -- to 0 so an unresolvable column reads as "ordinary", i.e. still verifiable.
+        ISNULL(COLUMNPROPERTY(OBJECT_ID(QUOTENAME(c.TABLE_SCHEMA) + '.' +
+                                        QUOTENAME(c.TABLE_NAME)),
+                              c.COLUMN_NAME, 'IsIdentity'), 0),
+        -- Computed (persisted or not): an INSERT may never supply a value.
+        CASE WHEN EXISTS (
+                 SELECT 1 FROM sys.computed_columns cc
+                 WHERE cc.object_id = OBJECT_ID(QUOTENAME(c.TABLE_SCHEMA) + '.' +
+                                                QUOTENAME(c.TABLE_NAME))
+                   AND cc.name = c.COLUMN_NAME)
+             THEN 1 ELSE 0 END,
+        CASE WHEN c.COLUMN_DEFAULT IS NOT NULL THEN 1 ELSE 0 END
     FROM INFORMATION_SCHEMA.COLUMNS c
     JOIN INFORMATION_SCHEMA.TABLES t
       ON t.TABLE_SCHEMA = c.TABLE_SCHEMA AND t.TABLE_NAME = c.TABLE_NAME
@@ -216,6 +240,9 @@ BEGIN
                     c.numeric_precision AS [numeric_precision],
                     c.numeric_scale     AS [numeric_scale],
                     c.datetime_precision AS [datetime_precision],
+                    CAST(c.is_identity AS bit) AS [is_identity],
+                    CAST(c.is_computed AS bit) AS [is_computed],
+                    CAST(c.has_default AS bit) AS [has_default],
                     c.null_count        AS [null_count],
                     CASE WHEN rc.row_count > 0 AND c.null_count IS NOT NULL
                          THEN CAST(ROUND(1.0 * c.null_count / rc.row_count, 6) AS decimal(9,6))

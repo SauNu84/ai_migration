@@ -108,6 +108,35 @@ class TestDialectIsPluggable(unittest.TestCase):
         explicit = ont.lift(profile, dialect=dl.PostgresDialect()).to_json()
         self.assertEqual(default, explicit)
 
+    def test_inet_host_mask_equivalence_and_its_boundary(self):
+        """Seam 5 (SAU-516): the `inet` equivalence, pinned at both edges.
+
+        The rule passes the test that separates it from an answer key — "an omitted mask
+        means the full host mask" is documented PostgreSQL semantics, written the same
+        way whether or not we had ever seen this corpus. The negative cases are the
+        load-bearing half: a rule broad enough to also swallow `/24 → /32` would trade a
+        real hole in gate coverage for cosmetics.
+        """
+        d = dl.PostgresDialect()
+        eq = lambda c, s: d.claim_equivalence(c, s, source_udt="inet", data_type="inet")
+        # in scope: the claim omits the mask, storage adds exactly the host mask
+        self.assertEqual(eq("203.0.113.42", "203.0.113.42/32"), dl.EQ_INET_HOST_MASK)
+        self.assertEqual(eq("::1", "::1/128"), dl.EQ_INET_HOST_MASK)
+        self.assertEqual(eq("2001:db8::8a2e:370:7334", "2001:db8::8a2e:370:7334/128"),
+                         dl.EQ_INET_HOST_MASK)
+        # out of scope — every one of these stays a finding
+        self.assertIsNone(eq("10.0.0.0/24", "10.0.0.0/32"))   # narrower net → one host
+        self.assertIsNone(eq("10.0.0.0/24", "10.0.0.0"))      # mask dropped entirely
+        self.assertIsNone(eq("203.0.113.42", "203.0.113.42/24"))   # not the host mask
+        self.assertIsNone(eq("203.0.113.42", "203.0.113.99/32"))   # different address
+        self.assertIsNone(eq("::1", "::1/32"))                # v4 host mask on a v6 addr
+        self.assertIsNone(eq("203.0.113.42", "203.0.113.42/128"))  # v6 mask on a v4 addr
+        self.assertIsNone(eq(None, "203.0.113.42/32"))
+        self.assertIsNone(eq("203.0.113.42", None))
+        # and it is scoped by the dialect's own physical-type token, not by shape
+        self.assertIsNone(d.claim_equivalence("203.0.113.42", "203.0.113.42/32",
+                                              source_udt="text", data_type="text"))
+
     def test_canonicalize_delegates_float_epsilon_to_dialect(self):
         # narrow float (float4) → 6 sig digits; wide → 12. Driven by the dialect token.
         v = "0.1234567"

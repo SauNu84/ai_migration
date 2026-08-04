@@ -208,6 +208,30 @@ class TestSqlServerPhysicalTokenTable(unittest.TestCase):
     def test_name(self):
         self.assertEqual(self.d.name, "sqlserver")
 
+    def test_seed_declarability_is_type_derived_not_a_column_list(self):
+        """The property that makes bullet 0's third state unabusable (SAU-516).
+
+        Declarability is decided by asking the dialect about the *type*, so a normal
+        column the seed forgot still fails, and the exemption cannot be widened by
+        appending to a list — only by misdeclaring a type. A pure unit test on purpose:
+        no rig, no interpreter floor, so the boundary is pinned everywhere.
+        """
+        d = self.d
+        self.assertFalse(d.is_seed_declarable({"data_type": "timestamp"}))
+        self.assertFalse(d.is_seed_declarable({"data_type": "rowversion"}))
+        # plain binary is NOT a rowversion — a seed names it like any other column
+        self.assertTrue(d.is_seed_declarable({"data_type": "varbinary"}))
+        self.assertTrue(d.is_seed_declarable({"data_type": "binary"}))
+        # IDENTITY is nameable under SET IDENTITY_INSERT, which this lane's seed uses
+        self.assertTrue(d.is_seed_declarable({"data_type": "int", "is_identity": True}))
+        # a DEFAULT is not an exemption: the seed *could* have named it
+        self.assertTrue(d.is_seed_declarable({"data_type": "varchar",
+                                              "has_default": True}))
+        # computed is the general category, inherited from the base dialect
+        self.assertFalse(d.is_seed_declarable({"data_type": "int", "is_computed": True}))
+        # unknown facts fail closed
+        self.assertTrue(d.is_seed_declarable({}))
+
     def test_token_classification(self):
         cases = [
             # (data_type, udt, expected token)
@@ -460,35 +484,37 @@ class TestSqlServerGateDB(unittest.TestCase):
     seed — the board-funded correctness proof. Source swap only; target/codegen/gate/
     reconcile reused verbatim."""
 
-    def test_transform_bullets_pass_on_sqlserver_seed(self):
-        """Bullets 1–4 — the *transform* half — still pass on the live SAU-323 seed.
+    def test_all_bullets_pass_on_sqlserver_seed(self):
+        """Every §8 bullet, bullet 0 included, on the live SAU-323 seed.
 
-        Narrowed, not weakened: bullet 0 (SAU-513) audits the *corpus* rather than the
-        transform and is asserted separately below, so its finding cannot turn this into
-        an opaque red.
+        Bullet 0's one finding on this lane (`audit_trail.row_version`) was ruled a
+        type-derived third state rather than a failure (SAU-516), so the whole gate is
+        GREEN — with the count below proving it is not green by having swallowed the
+        exempt column into the pass total.
         """
         gate, _ = gate_mod.run_gate(SS_PROFILE, SS_MANIFEST, clean_runs=3, regen_iters=3,
                                     dialect=dl.SqlServerDialect())
         for name, b in gate.bullets.items():
-            if name == "0_corpus_validity":
-                continue
             self.assertTrue(b["pass"], f"§8 bullet failed: {name}: {b}")
 
-    def test_corpus_validity_reports_rowversion_as_unverifiable(self):
-        """Bullet 0's one finding on this lane, pinned so it cannot drift silently.
+    def test_rowversion_is_counted_as_a_third_state_never_as_a_pass(self):
+        """The exempt column is reported in its own column of the count (SAU-516).
 
-        `audit_trail.row_version` is ROWVERSION: the engine generates it, so no INSERT can
-        name it and the seed states no claim bullet 0 could check. That is reported as a
-        failure rather than waved through — an unverifiable ground-truth column is a
-        decision for the COO (SAU-513 puts corpus fixes out of scope), not something this
-        gate should quietly call fine. Every other hard column round-trips its literal.
+        `audit_trail.row_version` is ROWVERSION: the server writes the counter, so no
+        INSERT can name it and the seed states no claim bullet 0 could check. Permanent
+        RED for that structural reason is a gate the team routes around; a pass would be
+        a lie. It is therefore neither — counted separately, and the arithmetic below is
+        what stops it quietly rejoining the verified total.
         """
         gate, _ = gate_mod.run_gate(SS_PROFILE, SS_MANIFEST, clean_runs=1, regen_iters=1,
                                     dialect=dl.SqlServerDialect())
         b0 = gate.bullets["0_corpus_validity"]
-        self.assertFalse(b0["pass"])
-        self.assertEqual([d["column"] for d in b0["drifted"]], ["audit_trail.row_version"])
-        self.assertEqual(b0["columns_intact"], b0["columns_audited"] - 1)
+        self.assertTrue(b0["pass"], b0)
+        self.assertEqual(b0["drifted"], [])
+        self.assertEqual([d["column"] for d in b0["not_seed_declarable"]],
+                         ["audit_trail.row_version"])
+        self.assertEqual(b0["columns_not_seed_declarable"], 1)
+        self.assertEqual(b0["columns_verified"], b0["columns_audited"] - 1)
 
     def test_all_sqlserver_traps_caught_zero_false_alarms(self):
         gate, _ = gate_mod.run_gate(SS_PROFILE, SS_MANIFEST, clean_runs=1, regen_iters=1,

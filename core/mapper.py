@@ -116,7 +116,23 @@ def map_property(entity: str, prop: ont.Property) -> Mapping:
         sf, rc = _varchar(prop), RC_EXACT_TEXT
     elif sem == ont.SEM_NETWORK:
         sf, rc = "VARCHAR(45)", RC_EXACT_TEXT
-        notes = "INET has no native Snowflake type — serialized losslessly to text (IPv4+IPv6)"
+        flags.append("canonical_text_differs_from_input")
+        # The contract this column actually offers a consumer, stated where the contract
+        # lives (SAU-516). Reconciliation is right to pass — the type's canonical text is
+        # what both sides read — but the *text* that lands in Snowflake is the type's
+        # output form, not the string the source application wrote. An app that inserted
+        # '203.0.113.42' finds '203.0.113.42/32' in the migrated column: same value under
+        # inet equality, different string under VARCHAR equality, and VARCHAR is what the
+        # target has. Anything downstream joining, matching or displaying this column has
+        # to know that, and no reconcile assertion can tell it — hence a note on the
+        # mapping rather than a gate finding.
+        notes = ("INET has no native Snowflake type — serialized losslessly to text "
+                 "(IPv4+IPv6). CONTRACT: the text is the type's CANONICAL form, which "
+                 "for a mask-less input carries the host mask the input omitted "
+                 "('203.0.113.42' → '203.0.113.42/32', '::1' → '::1/128'). Value-"
+                 "preserving under inet equality; NOT byte-identical to the string the "
+                 "source application supplied. Consumers doing string equality on the "
+                 "migrated VARCHAR must normalize.")
     elif sem == ont.SEM_ENUM:
         sf, rc = _varchar(prop, 64), RC_EXACT_TEXT
         flags.append("enum_domain")

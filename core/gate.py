@@ -193,18 +193,40 @@ def run_gate(profile_path: str | Path, manifest_path: str | Path,
             raise ValueError(f"no seed file known for source lane {dialect.name!r}")
         if not seed.exists():
             raise FileNotFoundError(f"seed file not found: {seed}")
-        audits = cp.audit_corpus(hard, seed, maps, udt_index, dialect=dialect)
+        # Catalog facts per column, for the two type-specific questions the audit must
+        # not answer itself: is this column declarable by an INSERT at all, and does the
+        # dialect declare a named equivalence between the seed's form and the type's
+        # canonical stored form (SAU-516).
+        col_facts = {k: {"data_type": p.data_type, "udt": p.udt,
+                         "is_identity": p.is_identity, "is_computed": p.is_computed,
+                         "has_default": p.has_default}
+                     for k, p in prop_index.items()}
+        audits = cp.audit_corpus(hard, seed, maps, udt_index, dialect=dialect,
+                                 col_facts=col_facts)
     except Exception as exc:  # noqa: BLE001 — a failed audit is a RED bullet, not a crash
         audit_error = f"{type(exc).__name__}: {exc}"
-    drifted = [a for a in audits if not a.ok]
+    # Three states, counted separately (SAU-516). `not-seed-declarable` is NOT folded
+    # into the verified total: a readout that reports 20/20 when one column was exempt
+    # is lying, and an honest three-column count is worth more than a clean two-column
+    # one. It does not fail the bullet either — the type forbade the claim, so there is
+    # nothing bullet 0 could have verified, and bullets 1–4 still reconcile the column.
+    drifted = [a for a in audits if a.verdict == cp.V_DRIFTED]
+    exempt = [a for a in audits if a.verdict == cp.V_NOT_DECLARABLE]
+    verified = [a for a in audits if a.verdict == cp.V_VERIFIED]
+    equivalences = [{"column": f"{a.entity}.{a.column}", **e}
+                    for a in audits for e in a.equivalences]
     gate.bullets["0_corpus_validity"] = {
         "pass": audit_error is None and bool(audits) and not drifted,
         # repo-relative so the committed readout is not machine-specific
         "seed": _rel(seed) if seed else None,
         "audit_error": audit_error,
         "columns_audited": len(audits),
-        "columns_intact": len(audits) - len(drifted),
+        "columns_verified": len(verified),
+        "columns_not_seed_declarable": len(exempt),
+        "columns_drifted": len(drifted),
         "drifted": [a.to_json() for a in drifted],
+        "not_seed_declarable": [a.to_json() for a in exempt],
+        "equivalences": equivalences,
         "detail": [a.to_json() for a in audits],
         "method": "each ground-truth column read back from the source through the "
                   "chassis' own extraction path and compared, as a multiset, against the "
@@ -393,6 +415,21 @@ def _target_compatible(got: str, expected: str) -> bool:
 
 # ── Readout ─────────────────────────────────────────────────────────────────
 
+def _b0_count(b0: dict[str, Any]) -> str:
+    """Bullet 0's headline count — three columns, never two (SAU-516).
+
+    `not-seed-declarable` is reported as its own number rather than added to the
+    verified total or hidden. Folding it either way would make the headline a claim the
+    audit did not make.
+    """
+    n = b0["columns_audited"]
+    exempt = b0.get("columns_not_seed_declarable", 0)
+    verified = b0.get("columns_verified", n - b0.get("columns_drifted", 0) - exempt)
+    tail = f" / {exempt} not-seed-declarable" if exempt else ""
+    return (f"{verified} verified{tail} / {b0.get('columns_drifted', 0)} drifted "
+            f"(of {n} ground-truth columns)")
+
+
 def write_readout(gate: GateResult, out_path: str | Path, *,
                   issue: str = "SAU-305", source_label: str = "Postgres",
                   target_label: str = "Snowflake",
@@ -411,8 +448,7 @@ def write_readout(gate: GateResult, out_path: str | Path, *,
     b0 = b.get("0_corpus_validity")
     if b0:
         A(f"| 0 | Corpus validity: the seeded ground truth actually landed in the source | "
-          f"{'✅ PASS' if b0['pass'] else '❌ FAIL'} — "
-          f"{b0['columns_intact']}/{b0['columns_audited']} ground-truth columns intact"
+          f"{'✅ PASS' if b0['pass'] else '❌ FAIL'} — {_b0_count(b0)}"
           + (f"; audit error: {b0['audit_error']}" if b0["audit_error"] else "") + " |")
 
     b1 = b["1_reconciliation"]
@@ -449,9 +485,7 @@ def write_readout(gate: GateResult, out_path: str | Path, *,
           "nothing. Bullet 0 anchors on the seed SQL instead, which the engine never "
           "touched.\n")
         A(f"- {b0['method']}")
-        A(f"- Seed audited: `{b0['seed']}` — "
-          f"**{b0['columns_intact']}/{b0['columns_audited']}** ground-truth columns hold "
-          "exactly what their INSERT claims.")
+        A(f"- Seed audited: `{b0['seed']}` — **{_b0_count(b0)}**.")
         if b0["audit_error"]:
             A(f"\n❌ The audit could not run: `{b0['audit_error']}`. Bullet 0 fails "
               "closed — an audit that did not run is not an audit that passed.")
@@ -467,8 +501,44 @@ def write_readout(gate: GateResult, out_path: str | Path, *,
                 note = f" — {d['error']}" if d["error"] else ""
                 A(f"| {d['column']}{note} | {d['comparison']} | {claimed} | {stored} |")
         elif not b0["audit_error"]:
-            A("\nNo drift: every ground-truth column round-trips the literal its INSERT "
-              "claims, so the traps the bullets below rely on are genuinely present.")
+            # Scoped to the columns that actually made a claim: with an exempt column
+            # present, "every ground-truth column round-trips its literal" would assert
+            # something about a column that never stated one.
+            scope = ("every ground-truth column that states a claim"
+                     if b0.get("columns_not_seed_declarable")
+                     else "every ground-truth column")
+            A(f"\nNo drift: {scope} round-trips the literal its INSERT claims, so the "
+              "traps the bullets below rely on are genuinely present.")
+
+        if b0.get("equivalences"):
+            # Constraint from the SAU-516 ruling: a canonicalization that hides its own
+            # application IS the invisible-normalization defect, one layer up. Both raw
+            # forms and the rule's name are printed so the reader can audit the rule
+            # itself, which is the entire difference between this and editing the seed.
+            A("\n### Reconciled under a named type equivalence\n")
+            A("The pairs below did **not** match byte-for-byte. Each was reconciled by a "
+              "rule the source dialect declares for that type — documented type "
+              "semantics, derivable without ever looking at our corpus — not by editing "
+              "what the seed claims. Raw forms are printed on both sides so the rule is "
+              "auditable:\n")
+            A("| column | claimed by the seed | actually stored | rule |")
+            A("|--------|---------------------|-----------------|------|")
+            for e in b0["equivalences"]:
+                A(f"| {e['column']} | `{e['claimed']}` | `{e['stored']}` | "
+                  f"`{e['rule']}` |")
+
+        if b0.get("not_seed_declarable"):
+            A("\n### Not seed-declarable (counted separately — NOT a pass)\n")
+            A("For the columns below the **type** forbids an INSERT from supplying a "
+              "value, so the seed states no claim for bullet 0 to check. That is bullet "
+              "0 declining a job that was never its, not a column going unverified: "
+              "bullets 1–4 still reconcile these columns. The exemption is derived from "
+              "the catalog, so it cannot be widened by appending to a list — only by "
+              "misdeclaring a type:\n")
+            A("| column | why it is not seed-declarable |")
+            A("|--------|-------------------------------|")
+            for d in b0["not_seed_declarable"]:
+                A(f"| {d['column']} | {d['not_seed_declarable']} |")
         A("")
 
     A("## 1 · Reconciliation runs\n")

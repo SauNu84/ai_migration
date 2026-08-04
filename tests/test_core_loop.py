@@ -26,6 +26,7 @@ from core import mapper as mp
 from core import codegen as cg
 from core import reconcile as rc
 from core import gate as gate_mod
+from core import dialect as dl
 
 ROOT = Path(__file__).resolve().parent.parent
 PROFILE = ROOT / "artifacts" / "profile.json"
@@ -188,35 +189,41 @@ class TestFrozenOntologyDeterminism(unittest.TestCase):
 
 @unittest.skipUnless(_pg_reachable(), "no Postgres reachable (set libpq env vars)")
 class TestVerificationLoopDB(unittest.TestCase):
-    def test_transform_bullets_pass(self):
-        """Bullets 1–4 — the *transform* half of the gate — still pass on this lane.
+    def test_all_bullets_pass(self):
+        """Every §8 bullet, bullet 0 included, passes on this lane.
 
-        This assertion is unchanged in substance; it is only narrowed to say what it has
-        always actually guaranteed. Bullet 0 (SAU-513) audits the *corpus* rather than the
-        transform, and it currently reports drift on this lane — see the test below, which
-        holds that finding explicitly instead of letting it turn this one an opaque red.
+        Bullet 0's `audit_log.ip_address` finding (SAU-513) was ruled a documented
+        `inet` type equivalence rather than drift (SAU-516), so the whole gate is GREEN
+        again — and the test below pins *how*, because "bullet 0 passes" is only worth
+        anything if the seed still makes the claim it always made.
         """
         gate, _ = gate_mod.run_gate(PROFILE, MANIFEST, clean_runs=3, regen_iters=3)
         for name, b in gate.bullets.items():
-            if name == "0_corpus_validity":
-                continue
             self.assertTrue(b["pass"], f"§8 bullet failed: {name}: {b}")
 
-    def test_gate_is_no_go_while_the_corpus_drift_is_open(self):
-        """The Postgres lane is NO-GO, and bullet 0 is the reason (SAU-513).
+    def test_bullet_zero_is_green_by_a_named_rule_not_by_a_seed_edit(self):
+        """The gate is GO — and the one thing that could make that a lie is excluded.
 
-        Deliberately asserted rather than skipped. `audit_log.ip_address` is seeded as
-        `'203.0.113.42'` and the engine stores `203.0.113.42/32`, so a ground-truth column
-        does not hold the literal its INSERT claims. Whether that is acceptable is the
-        COO's call — SAU-513 puts corpus fixes explicitly out of scope. Until that call is
-        made, the gate says NO-GO and this test says so out loud, so the state cannot be
-        mistaken for green or quietly re-seeded away.
+        `audit_log.ip_address` is still seeded as the bare `'203.0.113.42'` and the
+        engine still stores `203.0.113.42/32`. What changed in SAU-516 is that the
+        `inet` dialect declares an omitted mask to mean the full host mask — documented
+        type semantics, and equal under the type's own equality operator. So this test
+        asserts the *mechanism*, not just the colour: the pair is reconciled by a named
+        rule, both raw forms are on the record, and nothing was normalized into the
+        seed. Editing the seed to say `/32` would produce the same green with none of
+        the meaning, which is precisely what this guards against.
         """
         gate, _ = gate_mod.run_gate(PROFILE, MANIFEST, clean_runs=1, regen_iters=1)
         b0 = gate.bullets["0_corpus_validity"]
-        self.assertFalse(b0["pass"])
-        self.assertFalse(gate.passed)
-        self.assertEqual([d["column"] for d in b0["drifted"]], ["audit_log.ip_address"])
+        self.assertTrue(b0["pass"], b0)
+        self.assertTrue(gate.passed)
+        self.assertEqual(b0["drifted"], [])
+        eq = [e for e in b0["equivalences"] if e["column"] == "audit_log.ip_address"]
+        self.assertTrue(eq, "the inet column must be reconciled by an explicit rule")
+        self.assertEqual({e["rule"] for e in eq}, {dl.EQ_INET_HOST_MASK})
+        for e in eq:                      # the raw forms still disagree — that is the point
+            self.assertNotIn("/", e["claimed"])
+            self.assertTrue(e["stored"].startswith(e["claimed"] + "/"))
 
     def test_ablation_traps_all_caught(self):
         gate, _ = gate_mod.run_gate(PROFILE, MANIFEST, clean_runs=1, regen_iters=1)

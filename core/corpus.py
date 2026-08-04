@@ -26,6 +26,26 @@ the manifest by hand. A hand-written expectation is an answer key — it records
 someone believed the engine stored, which is the same belief bullet 0 exists to test
 (the SAU-505 lesson). The seed file is the only artifact that states the claim
 independently of the engine, so the seed file is the anchor.
+
+SAU-516 adds the two things bullet 0 needed to be *accurate* as well as strict, both of
+them asked of the dialect so this module never learns a type name:
+
+  • **Named type equivalences.** `inet '203.0.113.42'` stores as `203.0.113.42/32` —
+    the input grammar's abbreviation expanded to the type's canonical output form,
+    equal under the type's own equality operator, round-trip stable, nothing lost.
+    Filing that beside SAU-503's irreversible rounding costs the real findings their
+    credibility, and a bullet that cries wolf gets routed around. Each equivalence is
+    named, reported with both raw forms, and passes the test that separates it from
+    editing the seed: *would the rule have been written the same way before we saw this
+    failure?*
+
+  • **A third state, `not-seed-declarable`.** Some columns cannot be seeded at all —
+    ROWVERSION is written by the engine, a computed column is derived — so the seed
+    states no claim to check. Permanent RED for a structural reason trains the team to
+    route around the gate; a hand-written exemption list is an answer key by another
+    name. The discrimination comes from the *catalog* instead (engine-generated is a
+    property of the type), so it cannot be widened by editing a list, and it is counted
+    separately — never folded into the verified total.
 """
 from __future__ import annotations
 
@@ -191,6 +211,16 @@ def seed_claims(seed_path: str | Path, *, read: str) -> dict[tuple[str, str], li
 
 # ── The stored side, and the comparison ─────────────────────────────────────
 
+#: The three verdicts a column can carry (SAU-516). `NOT_DECLARABLE` is a third state,
+#: not a soft pass: the type forbids an INSERT from stating a claim, so bullet 0 has
+#: nothing of its own to verify and says so. It is counted separately and NEVER folded
+#: into the verified total — a readout that says 20/20 when one was exempt is lying, and
+#: an honest three-column count is worth more than a clean two-column one.
+V_VERIFIED = "verified"
+V_DRIFTED = "drifted"
+V_NOT_DECLARABLE = "not-seed-declarable"
+
+
 @dataclass
 class ColumnAudit:
     entity: str
@@ -201,19 +231,36 @@ class ColumnAudit:
     stored: list[str | None] = field(default_factory=list)
     missing: list[str | None] = field(default_factory=list)   # claimed, never stored
     unclaimed: list[str | None] = field(default_factory=list)  # stored, never claimed
+    #: pairs the dialect reconciled under a named type equivalence, each carrying BOTH
+    #: raw forms and the rule's name — see `_apply_equivalences`.
+    equivalences: list[dict[str, str | None]] = field(default_factory=list)
+    #: engine-generated: the type forbids an INSERT naming it, so no claim exists.
+    not_declarable: str | None = None
     error: str | None = None
 
     @property
+    def verdict(self) -> str:
+        if self.not_declarable is not None:
+            return V_NOT_DECLARABLE
+        if self.missing or self.unclaimed or self.error is not None:
+            return V_DRIFTED
+        return V_VERIFIED
+
+    @property
     def ok(self) -> bool:
-        return not self.missing and not self.unclaimed and self.error is None
+        """Not a *failure*. NB: `not-seed-declarable` is also not a pass — anything
+        counting outcomes must branch on `verdict`, which is why it is three-valued."""
+        return self.verdict != V_DRIFTED
 
     def to_json(self) -> dict[str, Any]:
         return {
             "column": f"{self.entity}.{self.column}", "reconcile": self.reconcile,
             "comparison": self.comparison, "seeded_rows": len(self.claimed),
-            "ok": self.ok, "error": self.error,
+            "verdict": self.verdict, "ok": self.ok, "error": self.error,
+            "not_seed_declarable": self.not_declarable,
             "claimed_but_not_stored": self.missing[:5],
             "stored_but_not_claimed": self.unclaimed[:5],
+            "reconciled_by_equivalence": self.equivalences[:5],
         }
 
 
@@ -259,6 +306,36 @@ def _dump_struct(o: Any) -> str:
     return json.dumps(o, ensure_ascii=False)
 
 
+def _apply_equivalences(missing: list[Any], unclaimed: list[Any], *,
+                        dialect: "dl.SourceDialect", source_udt: str, data_type: str
+                        ) -> tuple[list[Any], list[Any], list[dict[str, Any]]]:
+    """Pair off residuals the dialect reconciles under a named type equivalence.
+
+    Applied only to what the exact multiset comparison left over, so an equivalence can
+    never quietly relax a comparison that already agreed — it is consulted precisely
+    where there is a discrepancy, and each application is recorded with both raw forms
+    and the rule's name so the readout can print them (SAU-516, decision 1).
+
+    The audit itself stays type-agnostic: it knows *that* a dialect may declare
+    equivalences, never *which*. That separation is the whole point — a comparator that
+    learns type names is the answer key bullet 0 exists to detect.
+    """
+    left, pool = list(missing), list(unclaimed)
+    applied: list[dict[str, Any]] = []
+    kept: list[Any] = []
+    for c in left:
+        for i, s in enumerate(pool):
+            rule = dialect.claim_equivalence(c, s, source_udt=source_udt,
+                                             data_type=data_type)
+            if rule:
+                applied.append({"claimed": c, "stored": s, "rule": rule})
+                pool.pop(i)
+                break
+        else:
+            kept.append(c)
+    return kept, pool, applied
+
+
 def _multiset_diff(a: list[Any], b: list[Any]) -> list[Any]:
     """Elements of `a` not covered by `b`, counting multiplicity."""
     pool = list(b)
@@ -274,12 +351,21 @@ def _multiset_diff(a: list[Any], b: list[Any]) -> list[Any]:
 def audit_corpus(hard: list[dict[str, Any]], seed_path: str | Path,
                  mappings: list[Any], udt_index: dict[tuple[str, str], str],
                  *, dialect: "dl.SourceDialect | None" = None,
-                 read: str | None = None) -> list[ColumnAudit]:
+                 read: str | None = None,
+                 col_facts: dict[tuple[str, str], dict[str, Any]] | None = None,
+                 ) -> list[ColumnAudit]:
     """Read every hard column back from the source and audit it against the seed.
 
     Returns one `ColumnAudit` per manifest entry. A column the seed never names is an
     audit *failure*, not a skip: the manifest claims a trap is planted there, and
-    nothing planting it is exactly the SAU-503 shape.
+    nothing planting it is exactly the SAU-503 shape. The single exception is a column
+    the *type* forbids an INSERT from naming — see the third state below.
+
+    `col_facts` carries the profile's catalog facts per column (`data_type`, `udt`,
+    `is_identity`, `is_computed`, `has_default`); the dialect reads them to answer the
+    two type-specific questions this audit must not answer itself. Omitting it is safe
+    and fails closed: every column is then treated as seed-declarable with no
+    equivalences, i.e. the strictest reading.
     """
     dialect = dialect or dl.DEFAULT_DIALECT
     read = read or dialect.sql_read
@@ -314,15 +400,25 @@ def audit_corpus(hard: list[dict[str, Any]], seed_path: str | Path,
         elif isinstance(rows, Exception):
             a.error = f"source read failed: {rows}"
         elif key not in claims:
-            # Say only what is observable. The seed makes no claim about this column —
-            # which may mean the trap was never planted, or that the value is
-            # engine-generated (IDENTITY, ROWVERSION) and so is not seed-declarable at
-            # all. Bullet 0 cannot tell those apart, so it reports the fact and fails
-            # closed rather than guessing a cause or waving the column through.
+            # The seed makes no claim about this column. Two very different causes look
+            # identical from the seed alone — the trap was never planted, or the *type*
+            # forbids planting it (ROWVERSION, computed) — and the seed cannot tell them
+            # apart. The catalog can: being engine-generated is a property of the type,
+            # so the question goes to the dialect (SAU-516, decision 2). Unknown facts
+            # fail closed, so a normal column the seed forgot is still a failure.
             seeded = any(t == key[0] for t, _ in claims)
-            a.error = ("no INSERT names this column, so the seed claims nothing to verify"
-                       if seeded else
-                       f"the seed contains no parsed INSERT for table {key[0]!r}")
+            facts = (col_facts or {}).get(key, {})
+            if seeded and not dialect.is_seed_declarable(facts):
+                a.not_declarable = (
+                    f"engine-generated ({facts.get('data_type') or 'unknown type'}): no "
+                    f"INSERT can name this column, so the seed states no claim for "
+                    f"bullet 0 to verify. Counted separately — NOT as a pass. The column "
+                    f"is still reconciled by bullets 1–4."
+                )
+            else:
+                a.error = ("no INSERT names this column, so the seed claims nothing to verify"
+                           if seeded else
+                           f"the seed contains no parsed INSERT for table {key[0]!r}")
         else:
             udt = udt_index.get(key, "")
             raw = claims[key]
@@ -341,8 +437,18 @@ def audit_corpus(hard: list[dict[str, Any]], seed_path: str | Path,
             except Exception as exc:                 # noqa: BLE001
                 a.error = f"canonicalization failed: {type(exc).__name__}: {exc}"
             else:
-                a.missing = _multiset_diff(a.claimed, a.stored)
+                # Residuals first, then the dialect's named equivalences on what is
+                # left. `unclaimed` is still only *reported* when no row defaulted (a
+                # DEFAULT makes the counts non-comparable), but it is always computed —
+                # a column can carry both a defaulted row and an equivalence, and the
+                # pairing needs the stored side either way.
+                missing = _multiset_diff(a.claimed, a.stored)
+                unclaimed = _multiset_diff(a.stored, a.claimed)
+                missing, unclaimed, a.equivalences = _apply_equivalences(
+                    missing, unclaimed, dialect=dialect, source_udt=udt,
+                    data_type=(col_facts or {}).get(key, {}).get("data_type", ""))
+                a.missing = missing
                 if not defaulted:
-                    a.unclaimed = _multiset_diff(a.stored, a.claimed)
+                    a.unclaimed = unclaimed
         audits.append(a)
     return audits

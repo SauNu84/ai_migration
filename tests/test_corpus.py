@@ -71,13 +71,18 @@ def _mapping(entity: str, column: str, reconcile: str) -> mp.Mapping:
 
 def _audit_one(seed_sql: str, stored: list[dict[str, object]], *,
                reconcile: str = mp.RC_EXACT_TEXT,
-               entity: str = "t", column: str = "c") -> cp.ColumnAudit:
+               entity: str = "t", column: str = "c",
+               dialect: dl.SourceDialect | None = None,
+               facts: dict[str, object] | None = None) -> cp.ColumnAudit:
     """Audit a single column against a scripted seed and a scripted read-back."""
     seed = Path(_TMP.name) / "seed.sql"
     seed.write_text(seed_sql)
     hard = [{"table": entity, "column": column}]
     maps = [_mapping(entity, column, reconcile)]
-    audits = cp.audit_corpus(hard, seed, maps, {}, dialect=_StubDialect(stored))
+    audits = cp.audit_corpus(hard, seed, maps,
+                             {(entity, column): (facts or {}).get("udt", "")},
+                             dialect=dialect or _StubDialect(stored),
+                             col_facts={(entity, column): facts} if facts else None)
     return audits[0]
 
 
@@ -203,6 +208,57 @@ class TestAuditCatchesDrift(unittest.TestCase):
         self.assertTrue(a.ok, a.to_json())
         self.assertIn("DEFAULT", a.comparison)
 
+    def test_engine_added_host_mask_is_not_drift(self):
+        """SAU-516 decision 1: `inet` omits the mask; the type stores `/32`.
+
+        Equal under the type's own equality operator, round-trip stable, nothing lost —
+        so filing it beside SAU-503's irreversible rounding would cost the real findings
+        their credibility. Reconciled, and the rule that did it is named.
+        """
+        a = _audit_one("INSERT INTO t (c) VALUES ('203.0.113.42'), ('::1');",
+                       [{"c": "203.0.113.42/32"}, {"c": "::1/128"}],
+                       facts={"data_type": "inet", "udt": "inet"})
+        self.assertEqual(a.verdict, cp.V_VERIFIED, a.to_json())
+        self.assertEqual([e["rule"] for e in a.equivalences],
+                         [dl.EQ_INET_HOST_MASK] * 2)
+        # both raw forms survive into the record — an equivalence that hid its own
+        # application would be the invisible-normalization defect one layer up.
+        self.assertEqual(a.equivalences[0],
+                         {"claimed": "203.0.113.42", "stored": "203.0.113.42/32",
+                          "rule": dl.EQ_INET_HOST_MASK})
+
+    def test_narrower_mask_widened_to_host_mask_is_still_drift(self):
+        """The inverse test the ruling requires: `/24 → /32` must stay RED.
+
+        This is the boundary that separates a documented type equivalence from a
+        blanket strip-the-mask rule. `10.0.0.0/24` is a network of 256 addresses;
+        `/32` is one host. Reconciling those is real data loss, and a rule broad enough
+        to hide it would trade a genuine hole in gate coverage for cosmetics. The test
+        exists so the rule cannot be widened without something failing.
+        """
+        a = _audit_one("INSERT INTO t (c) VALUES ('10.0.0.0/24');",
+                       [{"c": "10.0.0.0/32"}],
+                       facts={"data_type": "inet", "udt": "inet"})
+        self.assertEqual(a.verdict, cp.V_DRIFTED, a.to_json())
+        self.assertEqual(a.missing, ["10.0.0.0/24"])
+        self.assertEqual(a.unclaimed, ["10.0.0.0/32"])
+        self.assertEqual(a.equivalences, [])
+
+    def test_equivalence_does_not_leak_to_other_types(self):
+        # The rule is scoped by the dialect's own physical-type token, so a text column
+        # holding an address-shaped string gets no such courtesy.
+        a = _audit_one("INSERT INTO t (c) VALUES ('203.0.113.42');",
+                       [{"c": "203.0.113.42/32"}],
+                       facts={"data_type": "text", "udt": "text"})
+        self.assertEqual(a.verdict, cp.V_DRIFTED, a.to_json())
+
+    def test_equivalence_is_opt_in_per_lane(self):
+        # The base dialect declares none: an equivalence nobody wrote down is
+        # indistinguishable from silently accepting drift.
+        self.assertIsNone(dl.SourceDialect.claim_equivalence(
+            dl.SqlServerDialect(), "203.0.113.42", "203.0.113.42/32",
+            source_udt="inet", data_type="inet"))
+
     def test_unreadable_seed_dialect_fails_closed(self):
         class _NoGrammar(_StubDialect):
             sql_read = ""
@@ -210,6 +266,94 @@ class TestAuditCatchesDrift(unittest.TestCase):
             cp.audit_corpus([{"table": "t", "column": "c"}], SEED,
                             [_mapping("t", "c", mp.RC_EXACT_TEXT)], {},
                             dialect=_NoGrammar([]))
+
+
+# ── The third state: not-seed-declarable (SAU-516 decision 2) ───────────────
+
+class _StubSqlServer(dl.SqlServerDialect):
+    """SQL Server lane with a scripted read-back."""
+
+    def __init__(self, rows: list[dict[str, object]]):
+        self._rows = rows
+
+    def extract_rows(self, entity, mappings):  # noqa: D102
+        return self._rows
+
+
+class TestNotSeedDeclarable(unittest.TestCase):
+    """The exemption must be derived from the type, and unabusable by construction.
+
+    Permanent RED for a structural reason is a gate the team routes around within two
+    sprints, and then it protects nothing. A hand-written exemption list is an answer key
+    by another name — the day someone appends a normal column to it, a genuinely
+    unplanted trap goes silent. The catalog is the third option: engine-generated is a
+    property of the *type*, so the only way to widen the exemption is to misdeclare one.
+    """
+
+    SEED = "INSERT INTO t (other) VALUES ('x');"
+
+    def _audit(self, facts):
+        return _audit_one(self.SEED, [{"c": "0x0000000000000007"}],
+                          dialect=_StubSqlServer([{"c": "0x0000000000000007"}]),
+                          facts=facts)
+
+    def test_rowversion_is_a_third_state_not_a_failure(self):
+        a = self._audit({"data_type": "timestamp", "udt": "timestamp"})
+        self.assertEqual(a.verdict, cp.V_NOT_DECLARABLE, a.to_json())
+        self.assertIn("no INSERT can name this column", a.not_declarable or "")
+
+    def test_third_state_is_not_a_pass(self):
+        # The distinction that keeps the readout honest: exempt is neither verified nor
+        # drifted, and must never be added to the verified total.
+        a = self._audit({"data_type": "timestamp", "udt": "timestamp"})
+        self.assertNotEqual(a.verdict, cp.V_VERIFIED)
+        self.assertNotEqual(a.verdict, cp.V_DRIFTED)
+
+    def test_a_normal_column_the_seed_forgot_still_fails(self):
+        # The whole load-bearing property. A plain VARCHAR is seed-declarable, so the
+        # seed forgetting it is exactly the SAU-503 shape and must stay RED.
+        a = self._audit({"data_type": "varchar", "udt": "varchar"})
+        self.assertEqual(a.verdict, cp.V_DRIFTED, a.to_json())
+        self.assertIn("claims nothing to verify", a.error or "")
+
+    def test_a_default_is_not_an_exemption(self):
+        """A DEFAULT-ed column is one an INSERT *may* name and this seed did not.
+
+        Exempting it would silence a trap by adding a DEFAULT to the schema — the
+        list-that-rots failure mode with extra steps. Row-level DEFAULTs are already
+        handled honestly one level down, as an announced weakening of the comparison.
+        """
+        a = self._audit({"data_type": "varchar", "udt": "varchar", "has_default": True})
+        self.assertEqual(a.verdict, cp.V_DRIFTED, a.to_json())
+
+    def test_identity_is_not_an_exemption_because_it_is_declarable(self):
+        # SET IDENTITY_INSERT lets an INSERT name it, and this lane's seed does exactly
+        # that — so IDENTITY is a fact about the column, not a licence to skip it.
+        a = self._audit({"data_type": "int", "udt": "int", "is_identity": True})
+        self.assertEqual(a.verdict, cp.V_DRIFTED, a.to_json())
+
+    def test_computed_columns_are_the_general_category(self):
+        # Not a ROWVERSION carve-out: the base dialect exempts computed columns for
+        # every lane, because no INSERT may supply their value in any of them.
+        a = _audit_one(self.SEED, [{"c": "x"}], facts={"data_type": "text",
+                                                       "is_computed": True})
+        self.assertEqual(a.verdict, cp.V_NOT_DECLARABLE, a.to_json())
+
+    def test_unknown_facts_fail_closed(self):
+        # No catalog facts at all → treated as declarable, i.e. still a failure. An
+        # exemption by omission is the one that would never be noticed.
+        a = _audit_one(self.SEED, [{"c": "x"}])
+        self.assertEqual(a.verdict, cp.V_DRIFTED, a.to_json())
+
+    def test_a_seeded_rowversion_would_still_be_verified(self):
+        # The exemption only applies where the seed states no claim. If an INSERT does
+        # name the column, bullet 0 checks it like any other — the third state is about
+        # a missing claim, never about skipping a present one.
+        a = _audit_one("INSERT INTO t (c) VALUES ('0x01');", [{"c": "0x02"}],
+                       dialect=_StubSqlServer([{"c": "0x02"}]),
+                       facts={"data_type": "timestamp", "udt": "timestamp"})
+        self.assertEqual(a.verdict, cp.V_DRIFTED, a.to_json())
+        self.assertEqual(a.missing, ["0x01"])
 
 
 # ── Gate wiring ─────────────────────────────────────────────────────────────
@@ -228,16 +372,9 @@ class TestGateWiring(unittest.TestCase):
             g.bullets[k] = {"pass": True}
         self.assertFalse(g.passed, "a corpus that did not land must make the gate RED")
 
-    def test_readout_names_the_column_and_both_values(self):
+    def _skeleton(self, b0: dict) -> gate_mod.GateResult:
         g = gate_mod.GateResult()
-        g.bullets["0_corpus_validity"] = {
-            "pass": False, "seed": "seed.sql", "audit_error": None,
-            "columns_audited": 2, "columns_intact": 1, "method": "m",
-            "drifted": [{"column": "audit_log.ip_address", "comparison": "multiset",
-                         "error": None, "claimed_but_not_stored": ["203.0.113.42"],
-                         "stored_but_not_claimed": ["203.0.113.42/32"]}],
-            "detail": [],
-        }
+        g.bullets["0_corpus_validity"] = b0
         for k, extra in (("1_reconciliation",
                           {"consecutive_clean_runs": 0, "required": 3,
                            "snowflake_compile_errors": [], "runs": []}),
@@ -251,46 +388,120 @@ class TestGateWiring(unittest.TestCase):
                           {"traps_caught": 0, "traps_injected": 0,
                            "false_alarms_on_correct_mapping": [], "detail": []})):
             g.bullets[k] = {"pass": True, **extra}
-        out = Path(_TMP.name) / "readout.md"
-        text = gate_mod.write_readout(g, out)
+        return g
+
+    def _readout(self, b0: dict) -> str:
+        return gate_mod.write_readout(self._skeleton(b0),
+                                      Path(_TMP.name) / "readout.md")
+
+    def test_readout_names_the_column_and_both_values(self):
+        text = self._readout({
+            "pass": False, "seed": "seed.sql", "audit_error": None,
+            "columns_audited": 2, "columns_verified": 1, "columns_drifted": 1,
+            "columns_not_seed_declarable": 0, "method": "m",
+            "drifted": [{"column": "audit_log.ip_address", "comparison": "multiset",
+                         "error": None, "claimed_but_not_stored": ["203.0.113.42"],
+                         "stored_but_not_claimed": ["203.0.113.42/32"]}],
+            "detail": [],
+        })
         self.assertIn("audit_log.ip_address", text)
         self.assertIn("203.0.113.42", text)          # claimed
         self.assertIn("203.0.113.42/32", text)       # actually stored
         self.assertIn("NO-GO", text)
+
+    def test_readout_prints_raw_forms_and_names_the_rule(self):
+        """SAU-516 constraint 3: an equivalence that hides its own application IS the
+        invisible-normalization defect, one layer up. Auditability is the entire
+        difference between declaring a type equivalence and editing the seed."""
+        text = self._readout({
+            "pass": True, "seed": "seed.sql", "audit_error": None,
+            "columns_audited": 1, "columns_verified": 1, "columns_drifted": 0,
+            "columns_not_seed_declarable": 0, "method": "m", "drifted": [],
+            "equivalences": [{"column": "audit_log.ip_address",
+                              "claimed": "203.0.113.42",
+                              "stored": "203.0.113.42/32",
+                              "rule": dl.EQ_INET_HOST_MASK}],
+            "detail": [],
+        })
+        self.assertIn("203.0.113.42", text)          # raw claimed
+        self.assertIn("203.0.113.42/32", text)       # raw stored
+        self.assertIn(dl.EQ_INET_HOST_MASK, text)    # …and the rule that reconciled them
+
+    def test_readout_never_folds_the_exempt_column_into_the_pass_total(self):
+        """A gate that reports 20/20 when one column was exempt is lying. Three
+        columns, always — an honest three-column count over a clean two-column one."""
+        text = self._readout({
+            "pass": True, "seed": "seed.sql", "audit_error": None,
+            "columns_audited": 20, "columns_verified": 19, "columns_drifted": 0,
+            "columns_not_seed_declarable": 1, "method": "m", "drifted": [],
+            "not_seed_declarable": [{"column": "audit_trail.row_version",
+                                     "not_seed_declarable": "engine-generated"}],
+            "detail": [],
+        })
+        self.assertIn("19 verified", text)
+        self.assertIn("1 not-seed-declarable", text)
+        self.assertIn("0 drifted", text)
+        self.assertNotIn("20/20", text)
+        self.assertIn("audit_trail.row_version", text)
 
 
 # ── The committed Postgres lane, audited for real ───────────────────────────
 
 @unittest.skipUnless(_pg_reachable(), "no Postgres reachable (set libpq env vars)")
 class TestCommittedPostgresLane(unittest.TestCase):
-    """Pins bullet 0's finding on the shipped lane.
+    """Pins bullet 0's verdict on the shipped lane, column by column.
 
-    This is a *characterization* test: it records what the audit currently finds, which
-    today is one drifted column. It is not an assertion that the drift is acceptable —
-    that call is the COO's (SAU-513 puts corpus fixes explicitly out of scope). The test
-    exists so the finding cannot be silently re-seeded away, and so any *new* drift, or
-    any change to this one, fails loudly instead of moving under us.
+    A *characterization* test: it records what the audit finds, so nothing can move
+    under us silently. Since SAU-516 the whole lane is expected to verify — the one
+    finding it carried (`audit_log.ip_address`) was ruled a documented type
+    equivalence, not drift. The equivalence assertions below are the load-bearing half:
+    they pin that the column is reconciled BY A NAMED RULE with both raw forms
+    recorded, not by the seed having been quietly edited to say `/32`.
     """
-
-    KNOWN_DRIFT = {"audit_log.ip_address"}
 
     def setUp(self):
         onto = ont.lift(ont.load_profile(PROFILE))
         self.maps = mp.map_ontology(onto)
         self.udt = {(e.name, p.name): p.udt for e in onto.entities for p in e.properties}
+        self.facts = {(e.name, p.name): {"data_type": p.data_type, "udt": p.udt,
+                                         "is_identity": p.is_identity,
+                                         "is_computed": p.is_computed,
+                                         "has_default": p.has_default}
+                      for e in onto.entities for p in e.properties}
         self.hard = json.loads(MANIFEST.read_text())["hard_columns"]
 
-    def test_known_drift_set_is_exactly_as_reported(self):
-        audits = cp.audit_corpus(self.hard, SEED, self.maps, self.udt)
-        self.assertEqual(len(audits), len(self.hard))
-        drifted = {f"{a.entity}.{a.column}" for a in audits if not a.ok}
-        self.assertEqual(drifted, self.KNOWN_DRIFT)
+    def _audits(self):
+        return cp.audit_corpus(self.hard, SEED, self.maps, self.udt,
+                               col_facts=self.facts)
 
-    def test_inet_drift_is_a_netmask_the_engine_added(self):
-        audits = cp.audit_corpus(self.hard, SEED, self.maps, self.udt)
-        a = next(x for x in audits if f"{x.entity}.{x.column}" == "audit_log.ip_address")
-        self.assertIn("203.0.113.42", a.missing)
-        self.assertIn("203.0.113.42/32", a.unclaimed)
+    def test_every_ground_truth_column_verifies(self):
+        audits = self._audits()
+        self.assertEqual(len(audits), len(self.hard))
+        self.assertEqual({a.verdict for a in audits}, {cp.V_VERIFIED},
+                         [a.to_json() for a in audits if a.verdict != cp.V_VERIFIED])
+
+    def test_the_inet_column_is_reconciled_by_the_named_rule_not_by_a_seed_edit(self):
+        a = next(x for x in self._audits()
+                 if f"{x.entity}.{x.column}" == "audit_log.ip_address")
+        self.assertEqual({e["rule"] for e in a.equivalences}, {dl.EQ_INET_HOST_MASK})
+        # the seed still claims the bare address, and the engine still stores the mask —
+        # both facts are on the record, which is what keeps the rule auditable
+        self.assertIn(("203.0.113.42", "203.0.113.42/32"),
+                      {(e["claimed"], e["stored"]) for e in a.equivalences})
+
+    def test_the_seed_was_not_edited_to_match_the_engine(self):
+        """The rejected option (a), pinned so it cannot arrive later by accident.
+
+        Normalizing the seed literal to `/32` would transcribe the engine's output back
+        into the claim — destroying the seed's independence, which is bullet 0's only
+        load-bearing property, and leaving a tautology that reports GREEN.
+        """
+        claims = cp.seed_claims(SEED, read="postgres")
+        vals = [cp._literal_text(v) for v in claims[("audit_log", "ip_address")]]
+        self.assertEqual(vals, ["203.0.113.42", "198.51.100.7", "::1",
+                                "2001:db8::8a2e:370:7334"])
+        for v in vals:
+            self.assertNotIn("/", v, "the seed must state the bare address it always did")
 
 
 if __name__ == "__main__":
