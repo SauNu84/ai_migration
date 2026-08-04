@@ -62,6 +62,11 @@ class SourceDialect(ABC):
     #: short identifier, e.g. "postgres", "sqlserver".
     name: str = "abstract"
 
+    #: sqlglot dialect for parsing this lane's seed file (§8 gate bullet 0, SAU-513).
+    #: Deliberately unset on the base: a lane that has not declared how its seed parses
+    #: must fail the corpus audit loudly rather than be parsed under a wrong grammar.
+    sql_read: str = ""
+
     # ── Seam 1: profiler-SQL template ───────────────────────────────────────
     @abstractmethod
     def profiler_install_sql(self) -> str:
@@ -171,6 +176,8 @@ class PostgresDialect(SourceDialect):
     """Postgres source lane. Reproduces the pre-SAU-322 hard-wired behavior exactly."""
 
     name = "postgres"
+    #: sqlglot dialect used to parse this lane's seed file (SAU-513 gate bullet 0).
+    sql_read = "postgres"
 
     # ── Seam 1 ──
     def profiler_install_sql(self) -> str:
@@ -329,6 +336,7 @@ class SqlServerDialect(SourceDialect):
     as the Postgres path; stateless."""
 
     name = "sqlserver"
+    sql_read = "tsql"
 
     # ── Seam 1: profiler-SQL template ───────────────────────────────────────
     def profiler_install_sql(self) -> str:

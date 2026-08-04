@@ -1,15 +1,29 @@
-# SAU-325 §8 Exit-Gate Readout — ✅ GO
+# SAU-325 §8 Exit-Gate Readout — ❌ NO-GO
 
 Phase 0/1 core loop: **lift → map → codegen → verification**. SQL Server → Snowflake, reconciled on a sample via a DuckDB execution proxy (Snowflake SQL is compile-checked in the Snowflake dialect).
 
 | # | Acceptance criterion | Result |
 |---|----------------------|--------|
+| 0 | Corpus validity: the seeded ground truth actually landed in the source | ❌ FAIL — 19/20 ground-truth columns intact |
 | 1 | 100% row-count + checksum on Gold, 3/3 clean runs | ✅ PASS — 3/3 consecutive clean; Snowflake compile errors: 0 |
 | 2 | Byte-identical SQL regeneration (SQLGlot) | ✅ PASS — 5 regenerations, 1 distinct digest(s) |
 | 2b | Byte-identical regen from FROZEN ontology (no re-inference) | ✅ PASS — 5 regens, 1 digest(s), matches live: True, inference re-entered: False |
 | 3 | Calibrated confidence vs hard-column manifest | ✅ PASS — 20/20 targets correct, 20/20 meet confidence floor |
 | 4 | Hard-fail: surface silent loss / coercion / masked mismatch | ✅ PASS — 14/14 injected traps caught, 0 false alarms |
 | 5 | Written readout for CTO go/no-go | ✅ this document |
+
+## 0 · Corpus validity (does the ground truth exist?)
+
+Bullets 1–4 below all validate the **transform**. None of them validates the **extraction**: reconciliation compares source-as-read to target-as-read, and both anchors sit *downstream* of anything the source engine normalized at INSERT. A trap the engine quietly rewrote is therefore invisible to them — the corpus still looks populated and the gate still goes GREEN while testing nothing. Bullet 0 anchors on the seed SQL instead, which the engine never touched.
+
+- each ground-truth column read back from the source through the chassis' own extraction path and compared, as a multiset, against the literal its INSERT claims to plant (parsed from the seed SQL, the one anchor the source engine never rewrote)
+- Seed audited: `sqlserver/schema/02_seed.sql` — **19/20** ground-truth columns hold exactly what their INSERT claims.
+
+❌ **The source does not hold what the seed claims** for the columns below. Anything downstream that relies on these columns is measuring a trap that was never planted:
+
+| column | comparison | claimed by the seed | actually stored |
+|--------|------------|---------------------|-----------------|
+| audit_trail.row_version — no INSERT names this column, so the seed claims nothing to verify | multiset | — | — |
 
 ## 1 · Reconciliation runs
 
@@ -91,4 +105,4 @@ This is a Phase-0 de-risk spike. The result is **necessary but not sufficient** 
 
 ## Verdict
 
-**✅ GO** for the §8 gate. All four technical criteria pass on the ≥15-table schema; feeds the CTO Phase-1 go/no-go.
+**❌ NO-GO** for the §8 gate. One or more criteria failed — see above; NOT ready for Phase-1 go.

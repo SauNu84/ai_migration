@@ -1,15 +1,29 @@
-# SAU-305 §8 Exit-Gate Readout — ✅ GO
+# SAU-305 §8 Exit-Gate Readout — ❌ NO-GO
 
-Phase 0 core loop: **lift → map → codegen → verification**. Postgres → Snowflake, reconciled on a sample via a DuckDB execution proxy (Snowflake SQL is compile-checked in the Snowflake dialect).
+Phase 0/1 core loop: **lift → map → codegen → verification**. Postgres → Snowflake, reconciled on a sample via a DuckDB execution proxy (Snowflake SQL is compile-checked in the Snowflake dialect).
 
 | # | Acceptance criterion | Result |
 |---|----------------------|--------|
+| 0 | Corpus validity: the seeded ground truth actually landed in the source | ❌ FAIL — 19/20 ground-truth columns intact |
 | 1 | 100% row-count + checksum on Gold, 3/3 clean runs | ✅ PASS — 3/3 consecutive clean; Snowflake compile errors: 0 |
 | 2 | Byte-identical SQL regeneration (SQLGlot) | ✅ PASS — 5 regenerations, 1 distinct digest(s) |
 | 2b | Byte-identical regen from FROZEN ontology (no re-inference) | ✅ PASS — 5 regens, 1 digest(s), matches live: True, inference re-entered: False |
 | 3 | Calibrated confidence vs hard-column manifest | ✅ PASS — 20/20 targets correct, 20/20 meet confidence floor |
 | 4 | Hard-fail: surface silent loss / coercion / masked mismatch | ✅ PASS — 15/15 injected traps caught, 0 false alarms |
 | 5 | Written readout for CTO go/no-go | ✅ this document |
+
+## 0 · Corpus validity (does the ground truth exist?)
+
+Bullets 1–4 below all validate the **transform**. None of them validates the **extraction**: reconciliation compares source-as-read to target-as-read, and both anchors sit *downstream* of anything the source engine normalized at INSERT. A trap the engine quietly rewrote is therefore invisible to them — the corpus still looks populated and the gate still goes GREEN while testing nothing. Bullet 0 anchors on the seed SQL instead, which the engine never touched.
+
+- each ground-truth column read back from the source through the chassis' own extraction path and compared, as a multiset, against the literal its INSERT claims to plant (parsed from the seed SQL, the one anchor the source engine never rewrote)
+- Seed audited: `schema/02_seed.sql` — **19/20** ground-truth columns hold exactly what their INSERT claims.
+
+❌ **The source does not hold what the seed claims** for the columns below. Anything downstream that relies on these columns is measuring a trap that was never planted:
+
+| column | comparison | claimed by the seed | actually stored |
+|--------|------------|---------------------|-----------------|
+| audit_log.ip_address | multiset | `203.0.113.42`, `198.51.100.7`, `::1`, `2001:db8::8a2e:370:7334` | `203.0.113.42/32`, `198.51.100.7/32`, `::1/128`, `2001:db8::8a2e:370:7334/128` |
 
 ## 1 · Reconciliation runs
 
@@ -25,7 +39,7 @@ Phase 0 core loop: **lift → map → codegen → verification**. Postgres → S
 ### 2b · Frozen-ontology regeneration (SAU-312 / CTO item ②)
 
 - Bullet 2 above re-lifts from the profile, which is byte-identical only because inference is a deterministic heuristic today. The real guarantee is this: the **approved ontology is frozen to a content-addressed artifact**, and regeneration loads that artifact and re-maps + re-codegens — the inference seam is never re-entered. The guarantee therefore survives an LLM entering inference.
-- Frozen-artifact SHA-256: `a09cd3f34ad3607a1525139f614693ce01043623ba26b54d7180801889748ca6`
+- Frozen-artifact SHA-256: `ba8d7dd87ddc15f9b2c8150efb0ba20b761abb09fe7474197fb76839a659dae0`
 - 5 regenerations from the frozen artifact → 1 distinct digest(s); matches the live generation: True.
 - Inference re-entered on the regen path: **False** (enforced by `assert_no_inference`).
 - Tampered-frozen-artifact rejected by integrity check: True.
@@ -89,4 +103,4 @@ This is a Phase-0 de-risk spike. The result is **necessary but not sufficient** 
 
 ## Verdict
 
-**✅ GO** for the §8 gate. All four technical criteria pass on the ≥15-table schema; feeds the CTO Phase-1 go/no-go.
+**❌ NO-GO** for the §8 gate. One or more criteria failed — see above; NOT ready for Phase-1 go.

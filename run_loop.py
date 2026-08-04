@@ -43,6 +43,7 @@ _LANES = {
         "dialect": dl.PostgresDialect,
         "profile": REPO / "artifacts" / "profile.json",
         "manifest": REPO / "ground_truth" / "hard_columns.json",
+        "seed": REPO / "schema" / "02_seed.sql",
         "readout": REPO / "GATE_READOUT.md",
         "issue": "SAU-305", "source_label": "Postgres", "caveats": [],
     },
@@ -50,6 +51,7 @@ _LANES = {
         "dialect": dl.SqlServerDialect,
         "profile": REPO / "artifacts" / "profile.sqlserver.json",
         "manifest": REPO / "sqlserver" / "ground_truth" / "hard_columns.sqlserver.json",
+        "seed": REPO / "sqlserver" / "schema" / "02_seed.sql",
         "readout": REPO / "GATE_READOUT.sqlserver.md",
         "issue": "SAU-325", "source_label": "SQL Server",
         "caveats": [
@@ -86,6 +88,7 @@ def main() -> int:
                     help="execution target (duckdb proxy [default] or live snowflake)")
     ap.add_argument("--profile")
     ap.add_argument("--manifest")
+    ap.add_argument("--seed", help="seed SQL audited by gate bullet 0 (corpus validity)")
     ap.add_argument("--out", default=str(REPO / "artifacts"))
     ap.add_argument("--readout")
     ap.add_argument("--clean-runs", type=int, default=3)
@@ -96,6 +99,7 @@ def main() -> int:
     target = _TARGETS[args.target]()
     profile_path = args.profile or str(lane["profile"])
     manifest_path = args.manifest or str(lane["manifest"])
+    seed_path = args.seed or str(lane["seed"])
     readout_path = args.readout or str(lane["readout"])
 
     out = Path(args.out)
@@ -133,7 +137,7 @@ def main() -> int:
     # Run the §8 gate.
     gate, detail = gate_mod.run_gate(profile_path, manifest_path,
                                      clean_runs=args.clean_runs, dialect=dialect,
-                                     target=target)
+                                     target=target, seed_path=seed_path)
     (out / f"gate_result{suffix}.json").write_text(
         json.dumps(gate.bullets, indent=2, default=str) + "\n"
     )

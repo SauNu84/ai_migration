@@ -188,11 +188,35 @@ class TestFrozenOntologyDeterminism(unittest.TestCase):
 
 @unittest.skipUnless(_pg_reachable(), "no Postgres reachable (set libpq env vars)")
 class TestVerificationLoopDB(unittest.TestCase):
-    def test_full_gate_passes(self):
+    def test_transform_bullets_pass(self):
+        """Bullets 1–4 — the *transform* half of the gate — still pass on this lane.
+
+        This assertion is unchanged in substance; it is only narrowed to say what it has
+        always actually guaranteed. Bullet 0 (SAU-513) audits the *corpus* rather than the
+        transform, and it currently reports drift on this lane — see the test below, which
+        holds that finding explicitly instead of letting it turn this one an opaque red.
+        """
         gate, _ = gate_mod.run_gate(PROFILE, MANIFEST, clean_runs=3, regen_iters=3)
         for name, b in gate.bullets.items():
+            if name == "0_corpus_validity":
+                continue
             self.assertTrue(b["pass"], f"§8 bullet failed: {name}: {b}")
-        self.assertTrue(gate.passed)
+
+    def test_gate_is_no_go_while_the_corpus_drift_is_open(self):
+        """The Postgres lane is NO-GO, and bullet 0 is the reason (SAU-513).
+
+        Deliberately asserted rather than skipped. `audit_log.ip_address` is seeded as
+        `'203.0.113.42'` and the engine stores `203.0.113.42/32`, so a ground-truth column
+        does not hold the literal its INSERT claims. Whether that is acceptable is the
+        COO's call — SAU-513 puts corpus fixes explicitly out of scope. Until that call is
+        made, the gate says NO-GO and this test says so out loud, so the state cannot be
+        mistaken for green or quietly re-seeded away.
+        """
+        gate, _ = gate_mod.run_gate(PROFILE, MANIFEST, clean_runs=1, regen_iters=1)
+        b0 = gate.bullets["0_corpus_validity"]
+        self.assertFalse(b0["pass"])
+        self.assertFalse(gate.passed)
+        self.assertEqual([d["column"] for d in b0["drifted"]], ["audit_log.ip_address"])
 
     def test_ablation_traps_all_caught(self):
         gate, _ = gate_mod.run_gate(PROFILE, MANIFEST, clean_runs=1, regen_iters=1)

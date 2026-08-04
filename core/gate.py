@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Any
 
 from . import ontology as ont
+from . import corpus as cp
 from . import mapper as mp
 from . import codegen as cg
 from . import reconcile as rc
@@ -141,10 +142,25 @@ def _frozen_integrity_enforced(frozen: dict[str, Any]) -> bool:
         return True
 
 
+#: Per-lane seed file, used by gate bullet 0 when the caller does not pass one.
+_SEED_BY_DIALECT = {
+    "postgres": REPO / "schema" / "02_seed.sql",
+    "sqlserver": REPO / "sqlserver" / "schema" / "02_seed.sql",
+}
+
+
+def _rel(p: Path) -> str:
+    try:
+        return str(p.resolve().relative_to(REPO))
+    except ValueError:
+        return str(p)
+
+
 def run_gate(profile_path: str | Path, manifest_path: str | Path,
              *, clean_runs: int = 3, regen_iters: int = 5,
              dialect: "dl.SourceDialect | None" = None,
-             target: "tg.TargetAdapter | None" = None) -> tuple[GateResult, dict[str, Any]]:
+             target: "tg.TargetAdapter | None" = None,
+             seed_path: str | Path | None = None) -> tuple[GateResult, dict[str, Any]]:
     dialect = dialect or dl.DEFAULT_DIALECT
     target = target or tg.DEFAULT_TARGET
     profile = ont.load_profile(profile_path)
@@ -161,6 +177,40 @@ def run_gate(profile_path: str | Path, manifest_path: str | Path,
 
     gate = GateResult()
     detail: dict[str, Any] = {}
+
+    # ── Bullet 0: corpus validity — did the seed actually land? (SAU-513) ────
+    # Bullets 1–4 all validate the *transform*. None validates the *extraction*: a value
+    # the source engine normalized before the chassis ever read it is invisible to them,
+    # because reconciliation's two anchors (source-as-read, target-as-read) are both
+    # downstream of that normalization. Bullet 0 anchors on the seed SQL instead — text
+    # the engine never touched — and must run first: if the corpus did not land, every
+    # bullet below is measuring a trap that was never planted.
+    seed = Path(seed_path) if seed_path else _SEED_BY_DIALECT.get(dialect.name)
+    audits: list[cp.ColumnAudit] = []
+    audit_error: str | None = None
+    try:
+        if seed is None:
+            raise ValueError(f"no seed file known for source lane {dialect.name!r}")
+        if not seed.exists():
+            raise FileNotFoundError(f"seed file not found: {seed}")
+        audits = cp.audit_corpus(hard, seed, maps, udt_index, dialect=dialect)
+    except Exception as exc:  # noqa: BLE001 — a failed audit is a RED bullet, not a crash
+        audit_error = f"{type(exc).__name__}: {exc}"
+    drifted = [a for a in audits if not a.ok]
+    gate.bullets["0_corpus_validity"] = {
+        "pass": audit_error is None and bool(audits) and not drifted,
+        # repo-relative so the committed readout is not machine-specific
+        "seed": _rel(seed) if seed else None,
+        "audit_error": audit_error,
+        "columns_audited": len(audits),
+        "columns_intact": len(audits) - len(drifted),
+        "drifted": [a.to_json() for a in drifted],
+        "detail": [a.to_json() for a in audits],
+        "method": "each ground-truth column read back from the source through the "
+                  "chassis' own extraction path and compared, as a multiset, against the "
+                  "literal its INSERT claims to plant (parsed from the seed SQL, the one "
+                  "anchor the source engine never rewrote)",
+    }
 
     # ── Bullet 1: 3/3 consecutive clean runs (row-count + checksum on Gold) ──
     run_summaries = []
@@ -358,6 +408,13 @@ def write_readout(gate: GateResult, out_path: str | Path, *,
     A("| # | Acceptance criterion | Result |")
     A("|---|----------------------|--------|")
 
+    b0 = b.get("0_corpus_validity")
+    if b0:
+        A(f"| 0 | Corpus validity: the seeded ground truth actually landed in the source | "
+          f"{'✅ PASS' if b0['pass'] else '❌ FAIL'} — "
+          f"{b0['columns_intact']}/{b0['columns_audited']} ground-truth columns intact"
+          + (f"; audit error: {b0['audit_error']}" if b0["audit_error"] else "") + " |")
+
     b1 = b["1_reconciliation"]
     A(f"| 1 | 100% row-count + checksum on Gold, 3/3 clean runs | "
       f"{'✅ PASS' if b1['pass'] else '❌ FAIL'} — {b1['consecutive_clean_runs']}/{b1['required']} "
@@ -381,6 +438,38 @@ def write_readout(gate: GateResult, out_path: str | Path, *,
       f"{'✅ PASS' if b4['pass'] else '❌ FAIL'} — {b4['traps_caught']}/{b4['traps_injected']} "
       f"injected traps caught, {len(b4['false_alarms_on_correct_mapping'])} false alarms |")
     A(f"| 5 | Written readout for CTO go/no-go | ✅ this document |\n")
+
+    if b0:
+        A("## 0 · Corpus validity (does the ground truth exist?)\n")
+        A("Bullets 1–4 below all validate the **transform**. None of them validates the "
+          "**extraction**: reconciliation compares source-as-read to target-as-read, and "
+          "both anchors sit *downstream* of anything the source engine normalized at "
+          "INSERT. A trap the engine quietly rewrote is therefore invisible to them — the "
+          "corpus still looks populated and the gate still goes GREEN while testing "
+          "nothing. Bullet 0 anchors on the seed SQL instead, which the engine never "
+          "touched.\n")
+        A(f"- {b0['method']}")
+        A(f"- Seed audited: `{b0['seed']}` — "
+          f"**{b0['columns_intact']}/{b0['columns_audited']}** ground-truth columns hold "
+          "exactly what their INSERT claims.")
+        if b0["audit_error"]:
+            A(f"\n❌ The audit could not run: `{b0['audit_error']}`. Bullet 0 fails "
+              "closed — an audit that did not run is not an audit that passed.")
+        if b0["drifted"]:
+            A("\n❌ **The source does not hold what the seed claims** for the columns "
+              "below. Anything downstream that relies on these columns is measuring a "
+              "trap that was never planted:\n")
+            A("| column | comparison | claimed by the seed | actually stored |")
+            A("|--------|------------|---------------------|-----------------|")
+            for d in b0["drifted"]:
+                claimed = ", ".join(f"`{v}`" for v in d["claimed_but_not_stored"]) or "—"
+                stored = ", ".join(f"`{v}`" for v in d["stored_but_not_claimed"]) or "—"
+                note = f" — {d['error']}" if d["error"] else ""
+                A(f"| {d['column']}{note} | {d['comparison']} | {claimed} | {stored} |")
+        elif not b0["audit_error"]:
+            A("\nNo drift: every ground-truth column round-trips the literal its INSERT "
+              "claims, so the traps the bullets below rely on are genuinely present.")
+        A("")
 
     A("## 1 · Reconciliation runs\n")
     for r in b1["runs"]:
