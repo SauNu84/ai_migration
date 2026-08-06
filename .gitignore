@@ -10,7 +10,7 @@ __pycache__/
 .venv-*/
 venv/
 
-# Orchestration scratch
+# Orchestration scratch (dagster home, run logs)
 .orch-tmp/
 
 # Env / secrets — never commit
