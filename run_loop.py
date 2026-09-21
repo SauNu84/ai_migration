@@ -143,7 +143,8 @@ def main() -> int:
     )
     readout = gate_mod.write_readout(gate, readout_path, issue=lane["issue"],
                                      source_label=lane["source_label"],
-                                     extra_caveats=lane["caveats"])
+                                     extra_caveats=lane["caveats"],
+                                     provenance=gate_mod.provenance(dialect, target))
     print(readout)
     print(f"\n[run_loop] artifacts → {out}  |  readout → {readout_path}")
     return 0 if gate.passed else 1

@@ -430,10 +430,61 @@ def _b0_count(b0: dict[str, Any]) -> str:
             f"(of {n} ground-truth columns)")
 
 
+def provenance(dialect: dl.SourceDialect, target: Any = None) -> dict[str, str]:
+    """Name the environment a gate result came from (SAU-538).
+
+    A readout is a measurement, and a measurement without its instrument is not
+    reproducible: the same commit is RED on Python 3.9 and GREEN on 3.11 for the SQL
+    Server lane (`datetime.fromisoformat` vs 7-digit fractions), and the frozen-ontology
+    digest moves whenever the seed behind the socket is rebuilt. So the readout states
+    interpreter, libraries, commit, source rig and execution proxy — verbatim, no
+    credentials. Wall-clock is deliberately omitted: it would make every regeneration a
+    diff, and it is not an input to the result.
+    """
+    import platform
+    import subprocess
+    import sys
+
+    def _ver(mod: str) -> str:
+        try:
+            return __import__(mod).__version__
+        except Exception:  # noqa: BLE001 — provenance must never fail the gate
+            return "(not importable)"
+
+    def _git(*args: str) -> str:
+        try:
+            out = subprocess.run(["git", *args], capture_output=True, text=True,
+                                 cwd=Path(__file__).resolve().parent.parent)
+            return out.stdout.strip() if out.returncode == 0 else "(no git)"
+        except OSError:
+            return "(no git)"
+
+    head = _git("rev-parse", "--short", "HEAD")
+    dirty = bool(_git("status", "--porcelain", "--", "core", "run_loop.py", "schema",
+                      "sqlserver", "profile"))
+    p: dict[str, str] = {
+        "interpreter": f"Python {sys.version.split()[0]} ({sys.executable})",
+        "platform": platform.platform(),
+        "sqlglot": _ver("sqlglot"),
+        "duckdb": _ver("duckdb"),
+        "commit": head + (" (+ uncommitted changes under core/, schema/, sqlserver/, "
+                          "profile/ or run_loop.py)" if dirty else ""),
+        "branch": _git("rev-parse", "--abbrev-ref", "HEAD"),
+        "execution_proxy": f"{getattr(target, 'name', 'duckdb')} "
+                           + (f"(duckdb {_ver('duckdb')})"
+                              if getattr(target, "name", "duckdb") == "duckdb"
+                              else "(live target)"),
+    }
+    for k, v in dialect.rig_descriptor().items():
+        p[f"source.{k}"] = v
+    return p
+
+
 def write_readout(gate: GateResult, out_path: str | Path, *,
                   issue: str = "SAU-305", source_label: str = "Postgres",
                   target_label: str = "Snowflake",
-                  extra_caveats: list[str] | None = None) -> str:
+                  extra_caveats: list[str] | None = None,
+                  provenance: dict[str, str] | None = None) -> str:
     b = gate.bullets
     lines: list[str] = []
     A = lines.append
@@ -629,6 +680,17 @@ def write_readout(gate: GateResult, out_path: str | Path, *,
       "semantic-type inference only — never SQL generation (the reliability lever).")
     for c in (extra_caveats or []):
         A(f"- {c}")
+
+    if provenance:
+        A("\n## Provenance — what produced this readout\n")
+        A("A gate result is a property of the environment as much as of the code "
+          "(the SQL Server lane is RED on Python 3.9 and GREEN on 3.11 with no code "
+          "change). Reproduce against *this*, not against \"the repo\":\n")
+        A("| key | value |")
+        A("|-----|-------|")
+        for k, v in provenance.items():
+            cell = str(v).replace("|", "\\|")
+            A(f"| `{k}` | {cell} |")
 
     A("\n## Verdict\n")
     A(f"**{verdict}** for the §8 gate. "

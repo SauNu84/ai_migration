@@ -149,6 +149,17 @@ class SourceDialect(ABC):
         """
         return None
 
+    # ── Provenance: what source rig produced a readout ──────────────────────
+    def rig_descriptor(self) -> dict[str, str]:
+        """Where this lane read from, in enough detail to reproduce a readout.
+
+        A gate result is a property of the *environment* as much as of the code —
+        the same commit goes RED/GREEN by interpreter and by which seed is behind the
+        socket. A readout that does not name its rig is not reproducible, so the
+        readout prints this verbatim. Never includes credentials.
+        """
+        return {}
+
     def is_seed_declarable(self, facts: dict[str, Any]) -> bool:
         """Whether an INSERT in this source *can* name this column and state a value.
 
@@ -259,6 +270,21 @@ class PostgresDialect(SourceDialect):
         """Install the profiler then invoke it; return the raw aggregate JSON string."""
         self._psql(self.profiler_install_sql(), context="psql install")
         return self._psql(self.profile_query(schema), context="psql profile").strip()
+
+    def rig_descriptor(self) -> dict[str, str]:
+        import os
+        env = os.environ
+        d = {
+            "source": "PostgreSQL via psql (libpq env)",
+            "PGHOST": env.get("PGHOST", "(default)"),
+            "PGPORT": env.get("PGPORT", "(default)"),
+            "PGDATABASE": env.get("PGDATABASE", "(default)"),
+        }
+        try:
+            d["server_version"] = self._psql("SELECT version()").strip()
+        except SystemExit:
+            d["server_version"] = "(unreachable)"
+        return d
 
     # ── Seam 2 ──
     def extraction_expr(self, column: str, reconcile: str) -> str:
@@ -498,6 +524,25 @@ class SqlServerDialect(SourceDialect):
         raise SystemExit(
             "sqlcmd profile returned no JSON document; sqlcmd said: "
             f"{out.strip()[:500] or '(nothing)'}")
+
+    def rig_descriptor(self) -> dict[str, str]:
+        import os
+        env = os.environ
+        d = {
+            "source": "SQL Server via sqlcmd",
+            "MSSQL_HOST": env.get("MSSQL_HOST", "localhost"),
+            "MSSQL_HOST_PORT": env.get("MSSQL_HOST_PORT", "14333"),
+            "MSSQL_DATABASE": env.get("MSSQL_DATABASE", "phase1"),
+            "SQLCMD": env.get("SQLCMD", "sqlcmd"),
+        }
+        try:
+            out = self._sqlcmd("SET NOCOUNT ON; SELECT @@VERSION")
+            d["server_version"] = next(
+                (ln.strip() for ln in out.splitlines() if ln.strip().startswith("Microsoft")),
+                out.strip().splitlines()[0] if out.strip() else "(empty)")
+        except SystemExit:
+            d["server_version"] = "(unreachable)"
+        return d
 
     # ── Seam 2: extraction-expr builder (the lossless wire form) ─────────────
     def _wire_expr(self, column: str, source_type: str, reconcile: str) -> str:
