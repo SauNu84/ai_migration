@@ -107,6 +107,26 @@ This is a Phase-0 de-risk spike. The result is **necessary but not sufficient** 
 - **DATETIME2(7) 100-ns** is preserved by the extraction wire form (ISO-8601 style 126 emits all 7 fractional digits) and asserted by the `TIMESTAMP_NTZ(7)` target type (Snowflake compile-checked). BUT the DuckDB execution proxy and Python `datetime` are microsecond-precision, so the reconciliation verifies the value at µs on both sides — the 7th digit's *live* round-trip is a Phase-1 confirmation on real Snowflake, not something the proxy can show. The 100-ns is not silently lost (the wire form keeps it); it is simply not yet re-executed at full scale.
 - **Rig adapter.** The lane ran against the containerized SQL Server 2022 seed (SAU-323) via `sqlserver/scripts/sqlcmd-rig.sh` (the image's bundled sqlcmd over `docker exec`, since no host sqlcmd is installed). The dialect's wire flags were also corrected to `-y 0` — the classic `-h -1 -y 0 -W` combo is rejected by that image's sqlcmd. Target rig is unchanged (target-agnostic source swap); when the live-Snowflake rig (SAU-308/309/310) lands, this lane inherits it for free.
 
+## Provenance — what produced this readout
+
+A gate result is a property of the environment as much as of the code (the SQL Server lane is RED on Python 3.9 and GREEN on 3.11 with no code change). Reproduce against *this*, not against "the repo":
+
+| key | value |
+|-----|-------|
+| `interpreter` | Python 3.11.12 (/usr/local/opt/python@3.11/bin/python3.11) |
+| `platform` | macOS-15.7.9-x86_64-i386-64bit |
+| `sqlglot` | 30.14.0 |
+| `duckdb` | 1.5.5 |
+| `commit` | 977bdeb |
+| `branch` | main |
+| `execution_proxy` | duckdb (duckdb 1.5.5) |
+| `source.source` | SQL Server via sqlcmd |
+| `source.MSSQL_HOST` | localhost |
+| `source.MSSQL_HOST_PORT` | 1433 |
+| `source.MSSQL_DATABASE` | phase1 |
+| `source.SQLCMD` | /Users/hung.nguyen.wax/github/ai_migration/sqlserver/scripts/sqlcmd-rig.sh |
+| `source.server_version` | Microsoft SQL Server 2022 (RTM-CU25) (KB5081477) - 16.0.4255.1 (X64) |
+
 ## Verdict
 
 **✅ GO** for the §8 gate. All four technical criteria pass on the ≥15-table schema; feeds the CTO Phase-1 go/no-go.

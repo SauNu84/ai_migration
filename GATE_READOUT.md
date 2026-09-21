@@ -48,7 +48,7 @@ Read the direction, not just the rows. Each rule is consulted only on residuals 
 ### 2b · Frozen-ontology regeneration (SAU-312 / CTO item ②)
 
 - Bullet 2 above re-lifts from the profile, which is byte-identical only because inference is a deterministic heuristic today. The real guarantee is this: the **approved ontology is frozen to a content-addressed artifact**, and regeneration loads that artifact and re-maps + re-codegens — the inference seam is never re-entered. The guarantee therefore survives an LLM entering inference.
-- Frozen-artifact SHA-256: `624eec00c8f3d1f7ad508350ad48eda12ed5e571cfe142061f8b5f9b82bd8c9b`
+- Frozen-artifact SHA-256: `304d60e2fadb30eed03c8102e4ed7939ad35ab2ec669cc5552959c60cc96e73f`
 - 5 regenerations from the frozen artifact → 1 distinct digest(s); matches the live generation: True.
 - Inference re-entered on the regen path: **False** (enforced by `assert_no_inference`).
 - Tampered-frozen-artifact rejected by integrity check: True.
@@ -109,6 +109,25 @@ This is a Phase-0 de-risk spike. The result is **necessary but not sufficient** 
 - **VARIANT/ARRAY** are stored as canonical JSON text in the DuckDB proxy; their *content* preservation is reconciled and their VARIANT/ARRAY typing is compile-validated, but native semi-structured behavior is a Phase-1 confirmation.
 - **Sample, not full volume.** Reconciliation ran on the seeded sample (≥15 tables, all documented traps). Phase 1 must reconcile at production volume and add scale/perf gates.
 - **Inference pass is deterministic heuristic** here (reproducible, calibratable). The seam is LLM-pluggable; if an LLM is introduced it stays isolated to semantic-type inference only — never SQL generation (the reliability lever).
+
+## Provenance — what produced this readout
+
+A gate result is a property of the environment as much as of the code (the SQL Server lane is RED on Python 3.9 and GREEN on 3.11 with no code change). Reproduce against *this*, not against "the repo":
+
+| key | value |
+|-----|-------|
+| `interpreter` | Python 3.11.12 (/usr/local/opt/python@3.11/bin/python3.11) |
+| `platform` | macOS-15.7.9-x86_64-i386-64bit |
+| `sqlglot` | 30.14.0 |
+| `duckdb` | 1.5.5 |
+| `commit` | 977bdeb |
+| `branch` | main |
+| `execution_proxy` | duckdb (duckdb 1.5.5) |
+| `source.source` | PostgreSQL via psql (libpq env) |
+| `source.PGHOST` | /tmp |
+| `source.PGPORT` | 5599 |
+| `source.PGDATABASE` | phase0 |
+| `source.server_version` | PostgreSQL 14.17 (Homebrew) on x86_64-apple-darwin23.6.0, compiled by Apple clang version 16.0.0 (clang-1600.0.26.6), 64-bit |
 
 ## Verdict
 
