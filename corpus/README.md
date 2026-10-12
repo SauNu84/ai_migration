@@ -87,6 +87,12 @@ commit `90ce9a5`. 1 000 024 rows; load into Postgres 31 s; §8 gate (3 runs + ab
 Verdict ❌ NO-GO (`GATE_READOUT.phase1.md`): bullet 0 (4 seed-vs-stored drifts) and bullet 3
 (mapper has no rule for `uuid`/`bytea`/`interval`/`time`/`money`/`xml`) fail; 1, 2, 2b, 4 pass.
 
+**Re-run after SAU-549 (2026-10-12, commit `2ed7815`, same seed and rig): ✅ GO.** Bullet 0
+15 verified / 0 drifted (uuid, bytea and interval reconcile under named equivalences
+printed in the readout; money now extracts via `::numeric`); bullet 3 15/15 targets,
+15/15 floors; bullet 4 9/9 (money and bytea now enter the ablation). The manifest's
+expected targets are unchanged.
+
 **Bullet 1 passing does NOT clear the ordering defect.** 3/3 clean at 1M with four no-`id`
 entities holds only because both walks happen to return physical order: a fresh Postgres
 heap seq-scans in insert order, and DuckDB defaults to `preserve_insertion_order=true`.

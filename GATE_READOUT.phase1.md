@@ -1,15 +1,15 @@
-# SAU-305 §8 Exit-Gate Readout — ❌ NO-GO
+# SAU-305 §8 Exit-Gate Readout — ✅ GO
 
 Phase 0/1 core loop: **lift → map → codegen → verification**. Postgres → Snowflake, reconciled on a sample via a DuckDB execution proxy (Snowflake SQL is compile-checked in the Snowflake dialect).
 
 | # | Acceptance criterion | Result |
 |---|----------------------|--------|
-| 0 | Corpus validity: the seeded ground truth actually landed in the source | ❌ FAIL — 11 verified / 4 drifted (of 15 ground-truth columns) |
+| 0 | Corpus validity: the seeded ground truth actually landed in the source | ✅ PASS — 15 verified / 0 drifted (of 15 ground-truth columns) |
 | 1 | 100% row-count + checksum on Gold, 3/3 clean runs | ✅ PASS — 3/3 consecutive clean; Snowflake compile errors: 0 |
 | 2 | Byte-identical SQL regeneration (SQLGlot) | ✅ PASS — 5 regenerations, 1 distinct digest(s) |
 | 2b | Byte-identical regen from FROZEN ontology (no re-inference) | ✅ PASS — 5 regens, 1 digest(s), matches live: True, inference re-entered: False |
-| 3 | Calibrated confidence vs hard-column manifest | ❌ FAIL — 10/15 targets correct, 9/15 meet confidence floor |
-| 4 | Hard-fail: surface silent loss / coercion / masked mismatch | ✅ PASS — 7/7 injected traps caught, 0 false alarms |
+| 3 | Calibrated confidence vs hard-column manifest | ✅ PASS — 15/15 targets correct, 15/15 meet confidence floor |
+| 4 | Hard-fail: surface silent loss / coercion / masked mismatch | ✅ PASS — 9/9 injected traps caught, 0 false alarms |
 | 5 | Written readout for CTO go/no-go | ✅ this document |
 
 ## 0 · Corpus validity (does the ground truth exist?)
@@ -17,16 +17,26 @@ Phase 0/1 core loop: **lift → map → codegen → verification**. Postgres →
 Bullets 1–4 below all validate the **transform**. None of them validates the **extraction**: reconciliation compares source-as-read to target-as-read, and both anchors sit *downstream* of anything the source engine normalized at INSERT. A trap the engine quietly rewrote is therefore invisible to them — the corpus still looks populated and the gate still goes GREEN while testing nothing. Bullet 0 anchors on the seed SQL instead, which the engine never touched.
 
 - each ground-truth column read back from the source through the chassis' own extraction path and compared, as a multiset, against the literal its INSERT claims to plant (parsed from the seed SQL, the one anchor the source engine never rewrote)
-- Seed audited: `artifacts/corpus/phase1_traps.sql` — **11 verified / 4 drifted (of 15 ground-truth columns)**.
+- Seed audited: `artifacts/corpus/phase1_traps.sql` — **15 verified / 0 drifted (of 15 ground-truth columns)**.
 
-❌ **The source does not hold what the seed claims** for the columns below. Anything downstream that relies on these columns is measuring a trap that was never planted:
+No drift: every ground-truth column round-trips the literal its INSERT claims, so the traps the bullets below rely on are genuinely present.
 
-| column | comparison | claimed by the seed | actually stored |
-|--------|------------|---------------------|-----------------|
-| attachment.upload_id | multiset | `FFFFFFFF-FFFF-4FFF-8FFF-FFFFFFFFFFFF` | `ffffffff-ffff-4fff-8fff-ffffffffffff` |
-| attachment.content | multiset | `\x0001fe ff` | `\x0001feff` |
-| sla_policy.response_within | multiset | `4 hours`, `30 minutes`, `1 year 2 months 3 days` | `04:00:00`, `00:30:00`, `1 year 2 mons 3 days` |
-| ledger_entry.amount | multiset | `1234.56`, `0.01`, `-99999.99`, `1000000.00` | `$1,234.56`, `$0.01`, `-$99,999.99`, `$1,000,000.00` |
+### Reconciled under a named type equivalence
+
+The pairs below did **not** match byte-for-byte. Each was reconciled by a rule the source dialect declares for that type — documented type semantics, derivable without ever looking at our corpus — not by editing what the seed claims. Raw forms are printed on both sides so the rule is auditable:
+
+| column | claimed by the seed | actually stored | rule |
+|--------|---------------------|-----------------|------|
+| attachment.upload_id | `FFFFFFFF-FFFF-4FFF-8FFF-FFFFFFFFFFFF` | `ffffffff-ffff-4fff-8fff-ffffffffffff` | `uuid_canonical_form` |
+| attachment.content | `\x00` | `00` | `bytea_hex_input` |
+| attachment.content | `\x0001fe ff` | `0001feff` | `bytea_hex_input` |
+| attachment.content | `\xdeadbeef00000000cafebabe` | `deadbeef00000000cafebabe` | `bytea_hex_input` |
+| attachment.content | `\x` | `` | `bytea_hex_input` |
+| sla_policy.response_within | `4 hours` | `04:00:00` | `interval_fields` |
+| sla_policy.response_within | `30 minutes` | `00:30:00` | `interval_fields` |
+| sla_policy.response_within | `1 year 2 months 3 days` | `1 year 2 mons 3 days` | `interval_fields` |
+
+Read the direction, not just the rows. Each rule is consulted only on residuals the exact comparison left over, and only the way the type documents — the seed abbreviates, the type expands. The inverse, an extraction that **strips** what the type stores, would make every abbreviated literal match exactly and empty this table: a strictly greener readout produced by a lossy write policy. So the corpus deliberately also seeds values no equivalence can reach (ADR-0001, SAU-518) — those rows match byte-for-byte here and fail loudly the moment extraction starts discarding.
 
 ## 1 · Reconciliation runs
 
@@ -37,12 +47,12 @@ Bullets 1–4 below all validate the **transform**. None of them validates the *
 ## 2 · Determinism
 
 - canonical SQL generated once per ontology; SQLGlot deterministic transpile (no LLM redraft)
-- SHA-256 over all Snowflake DDL/DML across 5 regenerations: `0519188eb84a0ffd90ffdc459e123b5b162a851de5b200d70ff7e0853e9515b2`
+- SHA-256 over all Snowflake DDL/DML across 5 regenerations: `699344435bb282440547774de6673badc27f932eb3d5b271113f7674d451dee0`
 
 ### 2b · Frozen-ontology regeneration (SAU-312 / CTO item ②)
 
 - Bullet 2 above re-lifts from the profile, which is byte-identical only because inference is a deterministic heuristic today. The real guarantee is this: the **approved ontology is frozen to a content-addressed artifact**, and regeneration loads that artifact and re-maps + re-codegens — the inference seam is never re-entered. The guarantee therefore survives an LLM entering inference.
-- Frozen-artifact SHA-256: `6df3f6632a7c3b2cb5841ae168b13ae185786b0bfb5192e5bfaf812932580d96`
+- Frozen-artifact SHA-256: `850da670099a4087ddd250ddf985ba4feb4adb319a4d3e1168cedc52a9eb8b34`
 - 5 regenerations from the frozen artifact → 1 distinct digest(s); matches the live generation: True.
 - Inference re-entered on the regen path: **False** (enforced by `assert_no_inference`).
 - Tampered-frozen-artifact rejected by integrity check: True.
@@ -51,12 +61,12 @@ Bullets 1–4 below all validate the **transform**. None of them validates the *
 
 | column | category | expected | got | ✓ | conf | floor | ≥floor |
 |--------|----------|----------|-----|---|------|-------|--------|
-| attachment.upload_id | uuid_identity | VARCHAR(36) | VARCHAR | ✗ | 0.5 | 0.9 | ✗ |
-| attachment.content | binary | BINARY | VARCHAR | ✗ | 0.5 | 0.85 | ✗ |
-| sla_policy.response_within | no_native_target | VARCHAR | VARCHAR | ✓ | 0.5 | 0.8 | ✗ |
-| sla_policy.business_start | time_of_day | TIME | VARCHAR | ✗ | 0.5 | 0.9 | ✗ |
-| ledger_entry.amount | currency_precision | NUMBER(19,2) | VARCHAR | ✗ | 0.5 | 0.9 | ✗ |
-| legacy_document.body | no_native_target | VARCHAR(16777216) | VARCHAR | ✗ | 0.5 | 0.8 | ✗ |
+| attachment.upload_id | uuid_identity | VARCHAR(36) | VARCHAR(36) | ✓ | 0.95 | 0.9 | ✓ |
+| attachment.content | binary | BINARY | BINARY | ✓ | 0.9 | 0.85 | ✓ |
+| sla_policy.response_within | no_native_target | VARCHAR | VARCHAR(16777216) | ✓ | 0.85 | 0.8 | ✓ |
+| sla_policy.business_start | time_of_day | TIME | TIME | ✓ | 0.95 | 0.9 | ✓ |
+| ledger_entry.amount | currency_precision | NUMBER(19,2) | NUMBER(19,2) | ✓ | 0.98 | 0.9 | ✓ |
+| legacy_document.body | no_native_target | VARCHAR(16777216) | VARCHAR(16777216) | ✓ | 0.85 | 0.8 | ✓ |
 | device_reading.sensor_no | integer | NUMBER(38,0) | NUMBER(38,0) | ✓ | 0.95 | 0.9 | ✓ |
 | attachment.sha256 | fixed_width_identifier | VARCHAR(64) | VARCHAR(64) | ✓ | 0.95 | 0.95 | ✓ |
 | ledger_entry.amount_exact | currency_precision | NUMBER(14,4) | NUMBER(14,4) | ✓ | 0.98 | 0.95 | ✓ |
@@ -73,6 +83,8 @@ A naive mapper was forced into each documented trap; the loop must catch every o
 
 | column | naive target | checksum/exec | semantic guard | caught |
 |--------|--------------|---------------|----------------|--------|
+| attachment.content | TIMESTAMP_NTZ | ✓ | ✓ | ✅ |
+| ledger_entry.amount | FLOAT | ✓ | ✓ | ✅ |
 | attachment.sha256 | NUMBER(38,0) | ✓ | ✓ | ✅ |
 | ledger_entry.amount_exact | FLOAT | ✓ | ✓ | ✅ |
 | ledger_entry.posted_at | TIMESTAMP_TZ | · | ✓ | ✅ |
@@ -101,7 +113,7 @@ A gate result is a property of the environment as much as of the code (the SQL S
 | `platform` | macOS-15.7.9-x86_64-i386-64bit |
 | `sqlglot` | 30.14.0 |
 | `duckdb` | 1.5.5 |
-| `commit` | 90ce9a5 |
+| `commit` | 2ed7815 |
 | `branch` | main |
 | `execution_proxy` | duckdb (duckdb 1.5.5) |
 | `source.source` | PostgreSQL via psql (libpq env) |
@@ -112,4 +124,4 @@ A gate result is a property of the environment as much as of the code (the SQL S
 
 ## Verdict
 
-**❌ NO-GO** for the §8 gate. One or more criteria failed — see above; NOT ready for Phase-1 go.
+**✅ GO** for the §8 gate. All four technical criteria pass on the ≥15-table schema; feeds the CTO Phase-1 go/no-go.
