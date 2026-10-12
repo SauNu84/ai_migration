@@ -17,3 +17,8 @@ venv/
 .env
 .env.local
 *.pem
+# SAU-532 Phase-1 corpus output (corpus/generate.py) and its gate artifacts. The reference
+# manifest — seed, SHA-256 of the SQL, per-entity in-DB content digests — is committed
+# under corpus/reference/ instead, because it IS the byte-identical acceptance record.
+artifacts/corpus/
+artifacts/phase1/

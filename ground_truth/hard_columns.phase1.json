@@ -1,0 +1,106 @@
+{
+  "$schema_note": "Ground truth for the SAU-532 Phase-1 corpus (corpus/generate.py). Same field shape as hard_columns.json so core/gate.py scores it identically. Two groups: (1) the SEVEN trap types Phase 0 never seeded — BYTEA, UUID, INTERVAL, MONEY, XML, TIME, SMALLINT — planted as hand-authored literals in VALUES-only tables so bullet 0 can audit that each landed; (2) known Phase-0 categories planted alongside so bullet 4's ablation still has traps to inject in this corpus. Expected targets were written from the type's documented semantics before any run, not from what the mapper happens to emit — a column the mapper cannot recognize is supposed to FAIL here; that is the finding, not a calibration error.",
+  "version": "0.1.0",
+  "issue": "SAU-532",
+  "dialect": { "source": "postgres", "target": "snowflake" },
+  "hard_columns": [
+    {
+      "table": "attachment", "column": "upload_id",
+      "pg_type": "uuid", "snowflake_target": "VARCHAR(36)",
+      "trap": "UUID — canonical 8-4-4-4-12 lowercase hex text; upper-case input is normalized by the type ('FFFFFFFF-…' → 'ffffffff-…'); must never be coerced to NUMBER or truncated",
+      "category": "uuid_identity", "assert": "36-char canonical text preserved; joins on it survive",
+      "confidence_floor": 0.9
+    },
+    {
+      "table": "attachment", "column": "content",
+      "pg_type": "bytea", "snowflake_target": "BINARY",
+      "trap": "BYTEA — variable-length raw bytes; hex on the wire ('\\x…'); a VARCHAR target stores the hex *text* and doubles size, a fixed BINARY(8) truncates",
+      "category": "binary", "assert": "byte identity preserved incl. empty value and embedded NUL",
+      "confidence_floor": 0.85
+    },
+    {
+      "table": "sla_policy", "column": "response_within",
+      "pg_type": "interval", "snowflake_target": "VARCHAR",
+      "trap": "INTERVAL — no native Snowflake type; '1 year 2 months' has no fixed second count, so coercing to a number of seconds is lossy; negative intervals exist",
+      "category": "no_native_target", "assert": "postgres interval text preserved verbatim, never parsed to a number",
+      "confidence_floor": 0.8
+    },
+    {
+      "table": "sla_policy", "column": "business_start",
+      "pg_type": "time", "snowflake_target": "TIME",
+      "trap": "TIME — a time-of-day with µs fraction and no date; mapping to TIMESTAMP invents a date, mapping to VARCHAR loses the type",
+      "category": "time_of_day", "assert": "wall-clock time incl. fraction preserved; 23:59:59.999999 does not roll over",
+      "confidence_floor": 0.9
+    },
+    {
+      "table": "ledger_entry", "column": "amount",
+      "pg_type": "money", "snowflake_target": "NUMBER(19,2)",
+      "trap": "MONEY — the wire form is LOCALE-FORMATTED text ('$1,234.56', '-$99,999.99'); ::text is not parseable as a number, and the value has fixed scale 2 under lc_monetary=en_US — extraction must go through ::numeric",
+      "category": "currency_precision", "assert": "exact decimal value preserved, sign and thousands intact",
+      "confidence_floor": 0.9
+    },
+    {
+      "table": "legacy_document", "column": "body",
+      "pg_type": "xml", "snowflake_target": "VARCHAR(16777216)",
+      "trap": "XML — no equality operator (profiler min/max/distinct all fail), no native target; PARSE_XML into VARIANT re-serializes (entity refs, attribute order), so only the text is lossless",
+      "category": "no_native_target", "assert": "document text preserved verbatim incl. entity references",
+      "confidence_floor": 0.8
+    },
+    {
+      "table": "device_reading", "column": "sensor_no",
+      "pg_type": "smallint", "snowflake_target": "NUMBER(38,0)",
+      "trap": "SMALLINT — int2 range incl. -32768 and 32767; a BOOLEAN or TINYINT guess from the small domain is wrong",
+      "category": "integer", "assert": "full int2 range preserved",
+      "confidence_floor": 0.9
+    },
+
+    {
+      "table": "attachment", "column": "sha256",
+      "pg_type": "char(64)", "snowflake_target": "VARCHAR(64)",
+      "trap": "fixed-width hex with leading zeros; must stay textual identity",
+      "category": "fixed_width_identifier", "assert": "string preserved", "confidence_floor": 0.95
+    },
+    {
+      "table": "ledger_entry", "column": "amount_exact",
+      "pg_type": "numeric(14,4)", "snowflake_target": "NUMBER(14,4)",
+      "trap": "high-precision currency — FLOAT loses the 4th decimal (0.0001)",
+      "category": "currency_precision", "assert": "exact decimal preserved", "confidence_floor": 0.95
+    },
+    {
+      "table": "ledger_entry", "column": "posted_at",
+      "pg_type": "timestamp", "snowflake_target": "TIMESTAMP_NTZ",
+      "trap": "timestamp WITHOUT time zone — TIMESTAMP_TZ invents an offset",
+      "category": "timestamp_tz_distinction", "assert": "wall-clock preserved incl. µs", "confidence_floor": 0.9
+    },
+    {
+      "table": "ledger_entry", "column": "memo_last4",
+      "pg_type": "char(4)", "snowflake_target": "VARCHAR(4)",
+      "trap": "fixed-width PII with leading zeros ('0042','0007') — NUMBER drops them",
+      "category": "pii_fixed_width", "assert": "leading zeros preserved", "confidence_floor": 0.95
+    },
+    {
+      "table": "legacy_document", "column": "doc_ref",
+      "pg_type": "varchar(32)", "snowflake_target": "VARCHAR(32)",
+      "trap": "numeric-looking legacy text ('000123', '4,50', '1e5') — must NOT be parsed",
+      "category": "ambiguous_text_numeric", "assert": "verbatim text", "confidence_floor": 0.7
+    },
+    {
+      "table": "device_reading", "column": "reading",
+      "pg_type": "real", "snowflake_target": "FLOAT",
+      "trap": "narrow float — 3.14159274 is the float4 nearest to π; identity is approximate and must be flagged lossy",
+      "category": "lossy_float", "assert": "within float epsilon; flagged lossy", "confidence_floor": 0.6
+    },
+    {
+      "table": "device_reading", "column": "tags",
+      "pg_type": "text[]", "snowflake_target": "ARRAY",
+      "trap": "array → ARRAY incl. the empty array and NULL, never a flattened string",
+      "category": "array", "assert": "element order + count preserved", "confidence_floor": 0.8
+    },
+    {
+      "table": "tax_rate_history", "column": "rate",
+      "pg_type": "numeric(9,6)", "snowflake_target": "NUMBER(9,6)",
+      "trap": "precision-sensitive rate — 0.088750 must not become 0.08875 in FLOAT",
+      "category": "rate_precision", "assert": "scale 6 preserved", "confidence_floor": 0.9
+    }
+  ]
+}

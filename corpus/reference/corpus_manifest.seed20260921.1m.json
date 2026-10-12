@@ -1,0 +1,351 @@
+{
+  "issue": "SAU-532",
+  "seed": 20260921,
+  "schema": "phase1",
+  "total_rows": 1000024,
+  "volume_rows": 1000000,
+  "trap_rows": 24,
+  "sha256_sql": "5bd616bd586ff8656ba5267e0711a0ae44f02b411d7bf5bdcb0d2d8b16e6f110",
+  "sha256_trap_sql": "5996d55c61bcbc1c5b5a810815c5067359e9e750340415cbfc3163f87ae500fa",
+  "mix": {
+    "a1": 650561,
+    "a2": 730667,
+    "b1": 704511416,
+    "b2": 1934927101
+  },
+  "shape": {
+    "entities": 27,
+    "dominant_entity": "event",
+    "dominant_rows": 550940,
+    "dominant_share": 0.5509,
+    "entities_without_unique_id": [
+      "page_view",
+      "metric_sample",
+      "api_request_log",
+      "event"
+    ],
+    "trap_types": [
+      "BYTEA",
+      "UUID",
+      "INTERVAL",
+      "MONEY",
+      "XML",
+      "TIME",
+      "SMALLINT"
+    ],
+    "trap_entities": [
+      "attachment",
+      "sla_policy",
+      "ledger_entry",
+      "legacy_document",
+      "device_reading",
+      "tax_rate_history"
+    ]
+  },
+  "entities": [
+    {
+      "name": "org",
+      "rows": 1000,
+      "has_unique_id": true,
+      "kind": "volume",
+      "note": ""
+    },
+    {
+      "name": "plan",
+      "rows": 10,
+      "has_unique_id": true,
+      "kind": "volume",
+      "note": ""
+    },
+    {
+      "name": "app_user",
+      "rows": 10000,
+      "has_unique_id": true,
+      "kind": "volume",
+      "note": ""
+    },
+    {
+      "name": "subscription",
+      "rows": 10000,
+      "has_unique_id": true,
+      "kind": "volume",
+      "note": ""
+    },
+    {
+      "name": "invoice",
+      "rows": 20000,
+      "has_unique_id": true,
+      "kind": "volume",
+      "note": ""
+    },
+    {
+      "name": "invoice_line",
+      "rows": 40000,
+      "has_unique_id": true,
+      "kind": "volume",
+      "note": ""
+    },
+    {
+      "name": "payment",
+      "rows": 20000,
+      "has_unique_id": true,
+      "kind": "volume",
+      "note": ""
+    },
+    {
+      "name": "product",
+      "rows": 2000,
+      "has_unique_id": true,
+      "kind": "volume",
+      "note": ""
+    },
+    {
+      "name": "customer_order",
+      "rows": 20000,
+      "has_unique_id": true,
+      "kind": "volume",
+      "note": ""
+    },
+    {
+      "name": "order_item",
+      "rows": 40000,
+      "has_unique_id": true,
+      "kind": "volume",
+      "note": ""
+    },
+    {
+      "name": "shipment",
+      "rows": 10000,
+      "has_unique_id": true,
+      "kind": "volume",
+      "note": ""
+    },
+    {
+      "name": "support_ticket",
+      "rows": 5000,
+      "has_unique_id": true,
+      "kind": "volume",
+      "note": ""
+    },
+    {
+      "name": "ticket_message",
+      "rows": 20000,
+      "has_unique_id": true,
+      "kind": "volume",
+      "note": ""
+    },
+    {
+      "name": "audit_log",
+      "rows": 30000,
+      "has_unique_id": true,
+      "kind": "volume",
+      "note": ""
+    },
+    {
+      "name": "feature_flag",
+      "rows": 50,
+      "has_unique_id": true,
+      "kind": "volume",
+      "note": ""
+    },
+    {
+      "name": "webhook_endpoint",
+      "rows": 1000,
+      "has_unique_id": true,
+      "kind": "volume",
+      "note": ""
+    },
+    {
+      "name": "webhook_delivery",
+      "rows": 20000,
+      "has_unique_id": true,
+      "kind": "volume",
+      "note": ""
+    },
+    {
+      "name": "page_view",
+      "rows": 100000,
+      "has_unique_id": false,
+      "kind": "volume",
+      "note": "no id, no PK \u2014 append-only clickstream"
+    },
+    {
+      "name": "metric_sample",
+      "rows": 60000,
+      "has_unique_id": false,
+      "kind": "volume",
+      "note": "no id AND exact-duplicate rows: every value is a function of g/97, so each row appears 97 times \u2014 the multiset has repeats, so 'sort by every column' is not a sufficient fix for the ordering defect either"
+    },
+    {
+      "name": "api_request_log",
+      "rows": 40000,
+      "has_unique_id": false,
+      "kind": "volume",
+      "note": "no id \u2014 SMALLINT in volume, INET in volume"
+    },
+    {
+      "name": "event",
+      "rows": 550940,
+      "has_unique_id": false,
+      "kind": "volume",
+      "note": "no id \u2014 \u226550% of all rows; the \u22655M-row entity at gate tier"
+    },
+    {
+      "name": "attachment",
+      "rows": 4,
+      "has_unique_id": true,
+      "kind": "trap",
+      "note": ""
+    },
+    {
+      "name": "sla_policy",
+      "rows": 4,
+      "has_unique_id": true,
+      "kind": "trap",
+      "note": ""
+    },
+    {
+      "name": "ledger_entry",
+      "rows": 4,
+      "has_unique_id": true,
+      "kind": "trap",
+      "note": ""
+    },
+    {
+      "name": "legacy_document",
+      "rows": 4,
+      "has_unique_id": true,
+      "kind": "trap",
+      "note": ""
+    },
+    {
+      "name": "device_reading",
+      "rows": 4,
+      "has_unique_id": true,
+      "kind": "trap",
+      "note": ""
+    },
+    {
+      "name": "tax_rate_history",
+      "rows": 4,
+      "has_unique_id": true,
+      "kind": "trap",
+      "note": ""
+    }
+  ],
+  "content_digests": {
+    "org": {
+      "rows": 1000,
+      "sha256": "aa6ea3f52c29327112c417d45879781806b0f18685072eef140739a02f99ae24"
+    },
+    "plan": {
+      "rows": 10,
+      "sha256": "ebb91247edcefa940f941819ededb21c2b0098c646deedd0a9bcb7fa76f93bf9"
+    },
+    "app_user": {
+      "rows": 10000,
+      "sha256": "8a4aa95d34d6a02f7683aef85fa86df7069927cd81128c78259aab267e7a0944"
+    },
+    "subscription": {
+      "rows": 10000,
+      "sha256": "32feb5e77233eb8ebef32c7fbda756456d074c741635bad752727bc011defd5a"
+    },
+    "invoice": {
+      "rows": 20000,
+      "sha256": "67c56599fa610908b37d1a32391f48525424feb8c32fb74bc5f7fe22fa88c90a"
+    },
+    "invoice_line": {
+      "rows": 40000,
+      "sha256": "46324f128ec645bc5009cec072f8d34827d74111aa1c5e04542c2037862ee48a"
+    },
+    "payment": {
+      "rows": 20000,
+      "sha256": "9aa759f44152af54b82e427589884d5a91d781969f22d1f433f8f40d3822b9c7"
+    },
+    "product": {
+      "rows": 2000,
+      "sha256": "d7ac4b943a877a5fb73bea201d7be06b23cb36bbfd8641c092591a8cf93dd1b6"
+    },
+    "customer_order": {
+      "rows": 20000,
+      "sha256": "8cb9fca41da0dd3b70174264d194c2e44420cb017c1cd56914d77bd2cf831ef1"
+    },
+    "order_item": {
+      "rows": 40000,
+      "sha256": "dfdefc9ffd80581526419fa6e970d9ebc01d6c622ccaf42dd7ca0487070c2a57"
+    },
+    "shipment": {
+      "rows": 10000,
+      "sha256": "7a6785b2d87d6808b1e44ef2d3e6bbf0b25124a6f26c274b9178c07f22c838d4"
+    },
+    "support_ticket": {
+      "rows": 5000,
+      "sha256": "60829927c6000b7d513dd54189b9dc7506381a025dda85d408ef517ab3410cd9"
+    },
+    "ticket_message": {
+      "rows": 20000,
+      "sha256": "21dc681917c6e3c2b74d0b988d801adb9a8af9545bac85890e295e4c2ebd7fe7"
+    },
+    "audit_log": {
+      "rows": 30000,
+      "sha256": "c56ce262fb104497d93a196ce4900be0cdfc167d76aa937bc6507fc4b2626156"
+    },
+    "feature_flag": {
+      "rows": 50,
+      "sha256": "1729faa6d65103616c6d7880207ca094e3fddf789c5164e3a40bd96e1018e08d"
+    },
+    "webhook_endpoint": {
+      "rows": 1000,
+      "sha256": "45c2823cf971ff7bd5bf0fd21565d965bac00fa3ebc1990458d2ec95e9794e32"
+    },
+    "webhook_delivery": {
+      "rows": 20000,
+      "sha256": "4665dd0face74ec005db8d33ffcfe5bb8bea6f4c46368f695612ea9e813dda82"
+    },
+    "page_view": {
+      "rows": 100000,
+      "sha256": "286fa26927155da9faffc7f3a1df1e18fe2411b8bbe196dcdbbbccff34e126d6"
+    },
+    "metric_sample": {
+      "rows": 60000,
+      "sha256": "18e8b9dd0fbe4aec8a2d364abc084322f92ae7cc9ad0b282119800b198d389e2"
+    },
+    "api_request_log": {
+      "rows": 40000,
+      "sha256": "c30603c585f2672be355c6c03121442df7bff6fc409637d949334fff66531ce1"
+    },
+    "event": {
+      "rows": 550940,
+      "sha256": "f6b8c2148e39eda441c7b049bf9a23aa0cfdce1cb8031eebf3fbcd29c4bd7d31"
+    },
+    "attachment": {
+      "rows": 4,
+      "sha256": "e0880fc700a88d765a93f2c71bee6c838c3207da89a1f8a4c3512a143c5252a1"
+    },
+    "sla_policy": {
+      "rows": 4,
+      "sha256": "7963ee88554e78bcd8d7eb75ba6200132489ce1c3af0a25668df617dd59c1af4"
+    },
+    "ledger_entry": {
+      "rows": 4,
+      "sha256": "fa49f23b4e5732ae54eccaf82956c966388056a81fe598ba869a8fa61bfe7d17"
+    },
+    "legacy_document": {
+      "rows": 4,
+      "sha256": "5d3e795056c8697e419e6a6fa4e56811b02d4cb0cfbde2049fb2ec569f9ee4f3"
+    },
+    "device_reading": {
+      "rows": 4,
+      "sha256": "df7317fc45fbb3733daceef72b54d59b93040562d9433c87e7560bcba4137223"
+    },
+    "tax_rate_history": {
+      "rows": 4,
+      "sha256": "b6b39b29a5a3130921c5f4863fccce6761b9b8bd5412792886f6138cea8a11ea"
+    }
+  },
+  "applied_to": {
+    "PGHOST": "/tmp",
+    "PGPORT": "5599",
+    "PGDATABASE": "phase0"
+  }
+}
