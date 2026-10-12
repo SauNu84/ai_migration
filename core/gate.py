@@ -92,6 +92,8 @@ def _all_clean(results: list[rc.EntityResult]) -> tuple[bool, list[str]]:
             continue
         if not r.row_match:
             problems.append(f"{r.entity}: row count {r.source_rows}≠{r.target_rows}")
+        if not r.row_alignment_match:
+            problems.append(f"{r.entity}: row tuples differ (values moved between rows)")
         for c in r.columns:
             if not c.match:
                 problems.append(f"{r.entity}.{c.column}: checksum mismatch ({c.reconcile})")

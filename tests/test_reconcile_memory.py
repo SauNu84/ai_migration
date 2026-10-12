@@ -15,6 +15,10 @@ inspection:
      is byte-identical to what the old slice produced, and `n_mismatches` carries the
      full count that the sample no longer implies.
 
+Row-paired diagnostics only exist for a key-ordered entity (SAU-548: a keyless entity's
+two walks have no common order to pair by), so the tests that read the sample or the
+full count use an `id` column.
+
 Run:
     python3 -m unittest tests.test_reconcile_memory -v
 """
@@ -66,7 +70,7 @@ class TestDiagnosticsAreBounded(unittest.TestCase):
                 self.assertLessEqual(len(cr.red_flags), rc._DIAG_CAP, f"n={n}")
 
     def test_full_mismatch_count_survives_the_cap(self):
-        res = _reconcile(5_000, ["a"], broken=True)
+        res = _reconcile(5_000, ["id"], broken=True)
         cr = res.columns[0]
         # The sample is bounded; the *scale* of the breakage is not lost with it.
         self.assertEqual(len(cr.mismatches), rc._DIAG_CAP)
@@ -89,9 +93,9 @@ class TestDiagnosticsAreBounded(unittest.TestCase):
         mismatching rows in row order. This reconstructs that expectation independently
         and asserts equality, so the cheap fix cannot silently change gate diagnostics.
         """
-        res = _reconcile(500, ["a"], broken=True)
+        res = _reconcile(500, ["id"], broken=True)
         cr = res.columns[0]
-        expected = [{"row": i, "source": f"a-{i}", "target": f"a-{i}-x"}
+        expected = [{"row": i, "source": f"id-{i}", "target": f"id-{i}-x"}
                     for i in range(rc._DIAG_CAP)]
         self.assertEqual(cr.mismatches, expected)
         self.assertEqual(len(cr.red_flags), rc._DIAG_CAP)
@@ -113,12 +117,12 @@ class TestDiagnosticsAreBounded(unittest.TestCase):
         increase in rows must produce no meaningful increase in peak.
         """
         def peak(n: int, *, broken: bool) -> int:
-            src = _rows(n, ["a"], broken=False)
-            tgt = _rows(n, ["a"], broken=broken)
-            ms = [_mapping("a")]
+            src = _rows(n, ["id"], broken=False)
+            tgt = _rows(n, ["id"], broken=broken)
+            ms = [_mapping("id")]
             tracemalloc.start()
             try:
-                res = rc.reconcile_entity(_Ec(), ms, src, tgt, {"a": "text"})
+                res = rc.reconcile_entity(_Ec(), ms, src, tgt, {"id": "text"})
                 mark = tracemalloc.get_traced_memory()[1]
             finally:
                 tracemalloc.stop()

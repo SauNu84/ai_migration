@@ -48,6 +48,10 @@ exact-duplicate rows (which defeats "sort by everything" as a cheap fix — the 
 has repeats). If a run surfaces this, the bar is not lowered to make it green: that is
 the bug the bar was built to find.
 
+(Since SAU-548 the loop gives keyless entities an order-independent multiset digest, so
+the paragraph above describes what this corpus *guards against regressing*, not a live
+defect.)
+
 ## The seven trap types Phase 0 never seeded
 
 `BYTEA`, `UUID`, `INTERVAL`, `MONEY`, `XML`, `TIME`, `SMALLINT`. Each is planted as a

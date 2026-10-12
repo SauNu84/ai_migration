@@ -10,7 +10,9 @@ the source, byte/precision-exact where the manifest demands it:
   2. **Execute** the medallion in DuckDB (the Snowflake-dialect execution proxy):
      load Bronze (all text) → run the SQLGlot-transpiled Silver (typed CASTs) → Gold.
   3. **Reconcile** Gold against the source: per-column canonicalization by the
-     mapped reconcile strategy, then row-count + per-column **checksum** equality.
+     mapped reconcile strategy, then row-count + per-column **checksum** equality
+     (id-ordered digest when the entity has an `id`; scan-order-free multiset digest
+     plus a row-tuple multiset when it does not — SAU-548, see `EntityDigest`).
   4. **Red flags** (hard fail regardless of run count): row loss, a NOT-NULL source
      value turning NULL, or any exact-class mismatch (silent precision/identity loss).
 
@@ -270,10 +272,18 @@ class EntityResult:
     row_match: bool
     columns: list[ColumnResult]
     exec_error: str | None = None
+    #: Row alignment held: every source row tuple reached Gold as the same tuple. For an
+    #: entity with an `id` this is carried by the id-ordered per-column digests and is
+    #: always True here; for a keyless entity it is the row-multiset comparison (SAU-548)
+    #: — the only thing that sees values swapped *between* rows of an otherwise intact
+    #: column multiset.
+    row_alignment_match: bool = True
 
 
 class ChecksumAccumulator:
     """Incremental, order-sensitive checksum over canonical values (SAU-511).
+
+    Used only for key-ordered entities; keyless ones use `MultisetAccumulator` (SAU-548).
 
     Byte-identical to the previous `_checksum(list)` by construction — same md5, same
     index-prefixed framing, same NULL sentinel — but fed one value at a time, so the
@@ -310,12 +320,85 @@ def _checksum(values: list[str | None]) -> str:
     return acc.hexdigest()
 
 
+_MOD128 = 1 << 128
+
+
+def _vhash(v: str | None) -> int:
+    """128-bit hash of one canonical value. NULL is a distinct tag, never a string."""
+    h = hashlib.blake2b(digest_size=16)
+    h.update(b"N" if v is None else b"V" + v.encode("utf-8"))
+    return int.from_bytes(h.digest(), "big")
+
+
+def _rhash(values: list[str | None]) -> int:
+    """128-bit hash of one canonical row tuple, length-framed so no two tuples share bytes."""
+    h = hashlib.blake2b(digest_size=16)
+    for v in values:
+        if v is None:
+            h.update(b"N")
+        else:
+            b = v.encode("utf-8")
+            h.update(b"V" + len(b).to_bytes(8, "big") + b)
+    return int.from_bytes(h.digest(), "big")
+
+
+class MultisetAccumulator:
+    """Order-independent checksum over canonical values (SAU-548).
+
+    The digest is the element count plus the **sum** of per-element 128-bit hashes mod
+    2^128 — a multiset hash, so any permutation of the same values gives the same digest
+    and a repeated value counts once per occurrence (XOR would cancel exact duplicates in
+    pairs, which `metric_sample` carries on purpose). It is used only where no row key
+    exists to pin the scan order; see `EntityDigest`.
+
+    What it gives up, stated: a per-column multiset cannot see a value that moved to a
+    different row of the same column. That is why a keyless `EntityDigest` also folds a
+    row-tuple multiset, which restores row alignment at entity granularity.
+    """
+
+    __slots__ = ("_s", "_n")
+
+    def __init__(self) -> None:
+        self._s = 0
+        self._n = 0
+
+    def add_hash(self, h: int) -> None:
+        self._s = (self._s + h) % _MOD128
+        self._n += 1
+
+    def update(self, v: str | None) -> None:
+        self.add_hash(_vhash(v))
+
+    @property
+    def n(self) -> int:
+        return self._n
+
+    def hexdigest(self) -> str:
+        return f"ms:{self._n:x}:{self._s:032x}"
+
+
 class EntityDigest:
     """One side (source or target) of an entity reconciliation, accumulated row by row.
 
-    Holds exactly one `ChecksumAccumulator` per mapped column plus a row counter, so its
-    footprint is O(columns) — independent of row count. Rows are pushed in PK order via
-    `add()`; nothing is retained after the canonical value is folded into the digest.
+    Holds exactly one accumulator per mapped column plus a row counter, so its footprint
+    is O(columns) — independent of row count.
+
+    **Ordered vs keyless (SAU-548).** Extraction and the Gold read both `ORDER BY "id"`
+    when the entity has one, so for those entities the two walks are aligned by key and
+    the order-sensitive `ChecksumAccumulator` is exact — it also catches a value moved
+    between rows. An entity with no `id` has no ORDER BY, so each walk returns whatever
+    scan order its engine produces (a parallel DuckDB scan or a Snowflake `COPY INTO`
+    makes no promise), and an ordered digest would turn a reorder into a flaky "dirty"
+    verdict indistinguishable from corruption. Keyless entities therefore get:
+
+      * a `MultisetAccumulator` per column — the per-column verdict, scan-order free; and
+      * one row-tuple multiset over all mapped columns — the row-alignment verdict. A
+        value swapped between two rows leaves every column multiset intact but changes
+        two row tuples, so it is caught here (attributed to the entity, not a column).
+
+    A total ORDER BY over every column was rejected: source and Gold sort different
+    physical types (wire text vs typed Gold) under different collations, so the two
+    engines would not agree on the order in the first place.
     """
 
     def __init__(self, mappings: list[mp.Mapping], udt_by_col: dict[str, str],
@@ -323,16 +406,25 @@ class EntityDigest:
         self._dialect = dialect or dl.DEFAULT_DIALECT
         self._cols = sorted(mappings, key=lambda m: m.column)
         self._udt = udt_by_col
-        self._acc = {m.column: ChecksumAccumulator() for m in self._cols}
+        #: True iff both walks are key-ordered — the same predicate as the `ORDER BY "id"`
+        #: in extraction and the Gold read, so the two can never disagree.
+        self.ordered = any(m.column == "id" for m in self._cols)
+        acc = ChecksumAccumulator if self.ordered else MultisetAccumulator
+        self._acc = {m.column: acc() for m in self._cols}
+        self._rows = None if self.ordered else MultisetAccumulator()
         self._n_rows = 0
 
     def add(self, row: dict[str, Any]) -> None:
-        for m in self._cols:
-            self._acc[m.column].update(
-                canonicalize(m.reconcile, row.get(m.column),
-                             source_udt=self._udt.get(m.column, ""),
-                             dialect=self._dialect)
-            )
+        vals = [
+            canonicalize(m.reconcile, row.get(m.column),
+                         source_udt=self._udt.get(m.column, ""),
+                         dialect=self._dialect)
+            for m in self._cols
+        ]
+        for m, v in zip(self._cols, vals):
+            self._acc[m.column].update(v)
+        if self._rows is not None:
+            self._rows.add_hash(_rhash(vals))
         self._n_rows += 1
 
     @property
@@ -341,6 +433,10 @@ class EntityDigest:
 
     def checksum(self, column: str) -> str:
         return self._acc[column].hexdigest()
+
+    def row_checksum(self) -> str | None:
+        """Row-tuple multiset digest for a keyless entity; None when key-ordered."""
+        return None if self._rows is None else self._rows.hexdigest()
 
 
 def _red_flag(m: mp.Mapping, i: int, sv: str | None, tv: str | None) -> str:
@@ -419,10 +515,16 @@ def reconcile_digests(ec: cg.EntityCode, mappings: list[mp.Mapping],
 
     sums = {m.column: (src.checksum(m.column), tgt.checksum(m.column)) for m in cols}
     dirty = [m.column for m in cols if sums[m.column][0] != sums[m.column][1]]
+    aligned = src.row_checksum() == tgt.row_checksum()
 
     diag: dict[str, tuple[list, list, int]] = {}
-    if dirty and diagnose_pairs is not None:
+    if dirty and diagnose_pairs is not None and src.ordered:
         diag = _diagnose(cols, dirty, diagnose_pairs(), udt_by_col, dialect)
+    elif dirty and not src.ordered:
+        # Keyless: zipping the two walks would pair rows by scan order, so any "example"
+        # would be an artifact of that order. Say so instead of inventing examples.
+        diag = {c: ([], [f"{c}: value multiset differs (keyless entity — no row key, "
+                         "so no row-paired examples)"], 0) for c in dirty}
 
     col_results: list[ColumnResult] = []
     for m in cols:
@@ -450,6 +552,7 @@ def reconcile_digests(ec: cg.EntityCode, mappings: list[mp.Mapping],
         target_rows=tgt.n_rows,
         row_match=row_match,
         columns=col_results,
+        row_alignment_match=aligned,
     )
 
 

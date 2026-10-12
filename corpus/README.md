@@ -94,3 +94,8 @@ Probe at the `event` size (550 940 rows, CTAS then unordered SELECT, 8 threads, 
 `preserve_insertion_order=true` → 1 digest; `false` → **5 distinct digests in 5 runs**.
 Snowflake makes no insertion-order promise after a parallel `COPY INTO`, so the gate tier
 will hit the defect that the proxy hides. The fix belongs in the loop, not in the corpus.
+
+**Fixed in the loop by SAU-548.** A keyless entity is now reconciled with an
+order-independent digest: an additive multiset hash per column (repeats counted, not
+cancelled) plus a row-tuple multiset that keeps row alignment. Keyed entities keep the
+`id`-ordered digest. See `core/reconcile.py::EntityDigest` and `tests/test_reconcile_order.py`.
