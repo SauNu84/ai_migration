@@ -98,6 +98,10 @@ SEM_LOSSY_FLOAT = "lossy_float"
 SEM_BOOLEAN = "boolean"
 SEM_INTEGER = "integer"
 SEM_BINARY = "binary"                 # raw bytes / row-version — preserved as BINARY, never time
+SEM_UUID = "uuid_identity"            # 128-bit identifier — canonical text, never numeric
+SEM_TIME_OF_DAY = "time_of_day"       # wall-clock time, no date invented
+SEM_INTERVAL = "interval_text"        # no native target — the type's text, never a number
+SEM_XML = "xml_text"                  # no native target — the document text, verbatim
 SEM_FREE_TEXT = "free_text"
 
 PII_SEMANTICS = {
@@ -414,6 +418,21 @@ def infer_property(col: dict[str, Any], *, is_pk: bool, is_fk: bool,
         sig.append("binary_identity_not_timestamp")
         return SEM_BINARY, 0.9, tags, sig
 
+    # The physical type alone pins each of these (SAU-549); confidences follow the
+    # existing type-pinned rules — identity/temporal like DATE, no-native-target like INET.
+    if ptok == dl.PT_UUID:
+        sig.append("uuid_physical_type")
+        return SEM_UUID, 0.95, tags, sig
+    if ptok == dl.PT_TIME:
+        sig.append("time_without_tz_physical_type")
+        return SEM_TIME_OF_DAY, 0.95, tags, sig
+    if ptok == dl.PT_INTERVAL:
+        sig.append("interval_no_native_target")
+        return SEM_INTERVAL, 0.85, tags, sig
+    if ptok == dl.PT_XML:
+        sig.append("xml_no_native_target")
+        return SEM_XML, 0.85, tags, sig
+
     # Fallback — unknown physical type → low confidence, surface for review.
     sig.append(f"unrecognized_type:{dt}/{udt}")
     return SEM_FREE_TEXT, 0.5, tags, sig
@@ -467,6 +486,9 @@ def lift(profile: dict[str, Any], dialect: "dl.SourceDialect | None" = None) -> 
             cname = c["name"]
             is_pk = cname == "id" and (c.get("data_type") in ("bigint", "integer"))
             is_fk = (tname, cname) in fk_cols
+            # a fixed-shape type the catalog reports as unbounded (SAU-549)
+            implied = dialect.implicit_shape(c.get("data_type") or "", c.get("udt") or "")
+            c = {**c, **{k: v for k, v in implied.items() if c.get(k) is None}}
             sem, conf, tags, sig = infer_property(
                 c, is_pk=is_pk, is_fk=is_fk, enum_udts=enum_udts, dialect=dialect
             )

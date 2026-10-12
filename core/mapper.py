@@ -27,6 +27,7 @@ RC_ARRAY_CANONICAL = "array_canonical"  # ordered element equality, scale preser
 RC_TS_INSTANT = "timestamp_instant"   # same UTC instant (tz-aware)
 RC_TS_WALL = "timestamp_wall"         # same wall-clock value (no tz applied)
 RC_BOOLEAN = "boolean"
+RC_TIME = "time_of_day"               # same wall-clock time, fraction digits normalized
 
 
 @dataclass
@@ -102,11 +103,30 @@ def map_property(entity: str, prop: ont.Property) -> Mapping:
     elif sem == ont.SEM_DATE:
         sf, rc = "DATE", RC_EXACT_TEXT
     elif sem == ont.SEM_BINARY:
-        # ROWVERSION / raw bytes — fixed-width BINARY identity, reconciled as exact hex
-        # text. Never a timestamp (the legacy 'timestamp' synonym is the trap).
-        n = prop.char_max_len if prop.char_max_len else 8
-        sf, rc = f"BINARY({n})", RC_EXACT_TEXT
+        # ROWVERSION / raw bytes — BINARY identity, reconciled as exact hex text. Never
+        # a timestamp (the legacy 'timestamp' synonym is the trap). Width only when the
+        # source fixes one: a variable-length source (bytea) in BINARY(8) truncates.
+        n = prop.char_max_len
+        sf, rc = (f"BINARY({n})" if n else "BINARY"), RC_EXACT_TEXT
         notes = "row-version/binary identity preserved as BINARY — not interpreted as time"
+    elif sem == ont.SEM_UUID:
+        sf, rc = "VARCHAR(36)", RC_EXACT_TEXT
+        notes = ("UUID → canonical 36-char lower-case text (Snowflake has no UUID type); "
+                 "never numeric, never truncated")
+    elif sem == ont.SEM_TIME_OF_DAY:
+        sf, rc = "TIME", RC_TIME
+        notes = "time-of-day — no date invented, µs fraction preserved"
+    elif sem == ont.SEM_INTERVAL:
+        sf, rc = "VARCHAR(16777216)", RC_EXACT_TEXT
+        flags.append("no_native_target")
+        notes = ("INTERVAL has no Snowflake type — the source text is kept verbatim "
+                 "(IntervalStyle postgres). Never parsed to seconds: '1 mon' has no "
+                 "fixed second count.")
+    elif sem == ont.SEM_XML:
+        sf, rc = "VARCHAR(16777216)", RC_EXACT_TEXT
+        flags.append("no_native_target")
+        notes = ("XML → text verbatim; PARSE_XML into VARIANT re-serializes (entity refs, "
+                 "attribute order), so only the text is lossless")
     elif sem in (ont.SEM_PII_FIXED_WIDTH, ont.SEM_FIXED_WIDTH_ID):
         sf, rc = _varchar(prop), RC_EXACT_TEXT
         notes = "fixed-width identity — must stay textual; numeric coercion drops leading zeros"

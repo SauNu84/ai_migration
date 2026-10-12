@@ -50,9 +50,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from datetime import time as dt_time
 from decimal import Decimal
 from typing import Any
 
@@ -200,6 +202,20 @@ def _canon_bool(v: Any) -> str | None:
     return s
 
 
+def _canon_time(v: Any) -> str | None:
+    """HH:MM:SS.ffffff — the source prints '08:30:00.5', the proxy hands back a
+    datetime.time; both mean the same wall-clock time. Parsed by hand: fromisoformat's
+    fraction grammar differs across the interpreters this repo runs on."""
+    if v is None:
+        return None
+    if isinstance(v, dt_time):
+        return f"{v.hour:02d}:{v.minute:02d}:{v.second:02d}.{v.microsecond:06d}"
+    m = re.fullmatch(r"(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,6}))?", str(v).strip())
+    if not m:
+        return str(v)          # unparseable stays verbatim, so it can only mismatch
+    return f"{m.group(1)}:{m.group(2)}:{m.group(3)}.{(m.group(4) or '').ljust(6, '0')}"
+
+
 def _canon_exact(v: Any) -> str | None:
     if v is None:
         return None
@@ -232,6 +248,8 @@ def canonicalize(reconcile: str, v: Any, *, source_udt: str = "",
         return _canon_ts_wall(v, dialect.fix_tz)
     if reconcile == mp.RC_BOOLEAN:
         return _canon_bool(v)
+    if reconcile == mp.RC_TIME:
+        return _canon_time(v)
     if reconcile == mp.RC_APPROX_FLOAT:
         sig = _FLOAT4_SIG if dialect.is_narrow_float(source_udt) else 12
         return _canon_float(v, sig)

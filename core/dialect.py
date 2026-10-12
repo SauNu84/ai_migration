@@ -53,6 +53,10 @@ PT_MONEY = "money"                    # fixed scale-4 currency (SQL Server MONEY
 PT_INTEGER = "integer"
 PT_TEXT = "text"                      # varchar / text
 PT_BINARY = "binary"                  # raw bytes / row-version counter (NOT a timestamp)
+PT_UUID = "uuid"                      # 128-bit identifier; canonical 36-char text form
+PT_TIME = "time"                      # time-of-day, no date, no zone
+PT_INTERVAL = "interval"              # duration with month/day/time fields — no native target
+PT_XML = "xml"                        # XML document — no native target, text is lossless
 PT_UNKNOWN = "unknown"
 
 
@@ -98,8 +102,11 @@ class SourceDialect(ABC):
 
     # ── Seam 2: extraction-expr builder ─────────────────────────────────────
     @abstractmethod
-    def extraction_expr(self, column: str, reconcile: str) -> str:
-        """Per-column SQL expression producing the lossless text wire value."""
+    def extraction_expr(self, column: str, reconcile: str, source_type: str = "") -> str:
+        """Per-column SQL expression producing the lossless text wire value.
+
+        `source_type` is the mapping's physical source type (e.g. 'money', 'bytea'),
+        for types whose lossless wire form is not the default text cast."""
 
     @abstractmethod
     def extract_rows(self, entity: str, mappings: list[Any]) -> list[dict[str, Any]]:
@@ -123,6 +130,17 @@ class SourceDialect(ABC):
     @abstractmethod
     def is_user_defined(self, data_type: str) -> bool:
         """Whether `data_type` denotes a user-defined (enum) domain in this source."""
+
+    def implicit_shape(self, data_type: str, udt: str) -> dict[str, int]:
+        """Length/precision/scale a type *fixes by definition* but the catalog leaves NULL.
+
+        `information_schema` reports precision only for types declared with one, so a
+        fixed-shape type (Postgres MONEY, SQL Server ROWVERSION) arrives looking
+        unbounded and the mapper would fall back to a guessed default. Keys are profile
+        column keys (`char_max_len`, `numeric_precision`, `numeric_scale`); lift applies
+        them only where the profile value is NULL. Default: nothing implied.
+        """
+        return {}
 
     # ── Seam 4: tz/float canonicalization hooks ─────────────────────────────
     @abstractmethod
@@ -287,10 +305,20 @@ class PostgresDialect(SourceDialect):
         return d
 
     # ── Seam 2 ──
-    def extraction_expr(self, column: str, reconcile: str) -> str:
+    def extraction_expr(self, column: str, reconcile: str, source_type: str = "") -> str:
         # Imported lazily to avoid a circular import (mapper has no source coupling).
         from . import mapper as mp
         col = f'"{column}"'
+        st = (source_type or "").split("(")[0].strip().lower()
+        # MONEY: `::text` is LOCALE-FORMATTED ('$1,234.56', '-$99,999.99') and parses as
+        # no number anywhere downstream; `::numeric` is the documented exact conversion.
+        if st == "money":
+            return f"{col}::numeric::text"
+        # BYTEA: plain lower-case hex, no '\x' prefix — the form a Snowflake BINARY
+        # accepts under its default BINARY_INPUT_FORMAT=HEX, so the bulk-load wire form
+        # and the cast agree. Independent of the session's bytea_output setting.
+        if st == "bytea":
+            return f"encode({col}, 'hex')"
         if reconcile == mp.RC_ARRAY_CANONICAL:
             # JSON array of element TEXT, order-preserving; NULL array → JSON null.
             return (
@@ -306,7 +334,8 @@ class PostgresDialect(SourceDialect):
         """The extraction query: one JSON object per row, PK-ordered."""
         cols = sorted(mappings, key=lambda m: m.column)
         pairs = ",\n      ".join(
-            f"'{m.column}', ({self.extraction_expr(m.column, m.reconcile)})" for m in cols
+            f"'{m.column}', ({self.extraction_expr(m.column, m.reconcile, m.pg_type)})"
+            for m in cols
         )
         has_id = any(m.column == "id" for m in cols)
         order = 'ORDER BY "id"' if has_id else ""
@@ -371,10 +400,33 @@ class PostgresDialect(SourceDialect):
             return PT_INTEGER
         if dt in _PG_TEXT_DT or ut in _PG_TEXT_UDT:
             return PT_TEXT
+        if dt == "uuid" or ut == "uuid":
+            return PT_UUID
+        if dt == "bytea" or ut == "bytea":
+            return PT_BINARY
+        if dt == "money" or ut == "money":
+            return PT_MONEY
+        # `time with time zone` (timetz) is deliberately NOT here: a TIME target would
+        # drop its offset, so it stays unrecognized and surfaces for review.
+        if dt == "time without time zone" or ut == "time":
+            return PT_TIME
+        if dt == "interval" or ut == "interval":
+            return PT_INTERVAL
+        if dt == "xml" or ut == "xml":
+            return PT_XML
         return PT_UNKNOWN
 
     def is_user_defined(self, data_type: str) -> bool:
         return (data_type or "").upper() == "USER-DEFINED"
+
+    def implicit_shape(self, data_type: str, udt: str) -> dict[str, int]:
+        """MONEY is an int8 count of minor units: 19 significant digits, and the scale
+        is the locale's `frac_digits` (lc_monetary). 2 holds for en_US and C; a locale
+        with 3 minor digits would be rounded by NUMBER(19,2) — and reconciliation of the
+        `::numeric` wire form would then fail loudly, not silently."""
+        if self.physical_token(data_type, udt) == PT_MONEY:
+            return {"numeric_precision": 19, "numeric_scale": 2}
+        return {}
 
     # ── Seam 4 ──
     def fix_tz(self, s: str) -> str:
@@ -599,11 +651,11 @@ class SqlServerDialect(SourceDialect):
         # char / nchar / varchar / nvarchar / text — verbatim (leading zeros, unicode).
         return f"CONVERT(nvarchar(max), {col})"
 
-    def extraction_expr(self, column: str, reconcile: str) -> str:
-        # Interface seam: when only the reconcile strategy is known (no physical type),
-        # fall back to the strategy-driven wire form. extract_rows uses the richer,
-        # type-aware `_wire_expr` (Mapping carries the source type) for full fidelity.
-        return self._wire_expr(column, "", reconcile)
+    def extraction_expr(self, column: str, reconcile: str, source_type: str = "") -> str:
+        # Interface seam: the type-aware `_wire_expr` (Mapping carries the source type)
+        # gives full fidelity; with no physical type it falls back to the strategy-driven
+        # wire form.
+        return self._wire_expr(column, source_type, reconcile)
 
     def _extract_sql(self, entity: str, mappings: list[Any]) -> str:
         """The extraction query: one FOR JSON object per row, PK-ordered.
@@ -685,6 +737,12 @@ class SqlServerDialect(SourceDialect):
         if dt in _MS_TEXT:
             return PT_TEXT
         return PT_UNKNOWN
+
+    def implicit_shape(self, data_type: str, udt: str) -> dict[str, int]:
+        # ROWVERSION is an 8-byte counter by definition; the catalog reports no length.
+        if (data_type or "").lower() in _MS_ROWVERSION:
+            return {"char_max_len": 8}
+        return {}
 
     def is_user_defined(self, data_type: str) -> bool:
         # SQL Server has no native ENUM; the seed encodes domains as VARCHAR + CHECK

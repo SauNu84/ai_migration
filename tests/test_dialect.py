@@ -166,5 +166,62 @@ class TestDialectIsPluggable(unittest.TestCase):
         self.assertEqual(narrow, f"{float(v):.6g}")
 
 
+class TestPostgresTypeRulesSau549(unittest.TestCase):
+    """SAU-549: uuid / bytea / interval / time / money / xml each get a type-pinned rule
+    instead of the `unrecognized_type` VARCHAR@0.5 fallback."""
+
+    def setUp(self):
+        self.d = dl.PostgresDialect()
+
+    def _map(self, data_type, udt, **extra):
+        col = {"name": "c", "ordinal": 1, "data_type": data_type, "udt": udt, **extra}
+        onto = ont.lift({"tables": [{"table": "t", "columns": [col]}]}, dialect=self.d)
+        return mp.map_ontology(onto)[0]
+
+    def test_tokens(self):
+        tok = self.d.physical_token
+        self.assertEqual(tok("uuid", "uuid"), dl.PT_UUID)
+        self.assertEqual(tok("bytea", "bytea"), dl.PT_BINARY)
+        self.assertEqual(tok("money", "money"), dl.PT_MONEY)
+        self.assertEqual(tok("time without time zone", "time"), dl.PT_TIME)
+        self.assertEqual(tok("interval", "interval"), dl.PT_INTERVAL)
+        self.assertEqual(tok("xml", "xml"), dl.PT_XML)
+        # timetz would lose its offset in a TIME target — stays unrecognized
+        self.assertEqual(tok("time with time zone", "timetz"), dl.PT_UNKNOWN)
+
+    def test_targets_and_confidence(self):
+        cases = {
+            ("uuid", "uuid"): ("VARCHAR(36)", 0.95),
+            ("bytea", "bytea"): ("BINARY", 0.9),          # unbounded — never BINARY(8)
+            ("money", "money"): ("NUMBER(19,2)", 0.98),   # int8 minor units, fixed scale
+            ("time without time zone", "time"): ("TIME", 0.95),
+            ("interval", "interval"): ("VARCHAR(16777216)", 0.85),
+            ("xml", "xml"): ("VARCHAR(16777216)", 0.85),
+        }
+        for (dt, udt), (target, conf) in cases.items():
+            m = self._map(dt, udt)
+            self.assertEqual((m.snowflake_type, m.confidence), (target, conf), dt)
+        self.assertEqual(self._map("time without time zone", "time").reconcile, mp.RC_TIME)
+
+    def test_implicit_shape_never_overrides_the_catalog(self):
+        m = self._map("money", "money", numeric_precision=10, numeric_scale=4)
+        self.assertEqual(m.snowflake_type, "NUMBER(10,4)")
+
+    def test_extraction_wire_forms(self):
+        self.assertEqual(self.d.extraction_expr("amount", mp.RC_EXACT_TEXT, "money(19,2)"),
+                         '"amount"::numeric::text')
+        self.assertEqual(self.d.extraction_expr("content", mp.RC_EXACT_TEXT, "bytea"),
+                         "encode(\"content\", 'hex')")
+        self.assertEqual(self.d.extraction_expr("x", mp.RC_EXACT_TEXT, "uuid"), '"x"::text')
+
+    def test_time_canonicalization(self):
+        from datetime import time
+        c = lambda v: rc.canonicalize(mp.RC_TIME, v)
+        self.assertEqual(c("08:30:00.5"), c(time(8, 30, 0, 500000)))
+        self.assertEqual(c("23:59:59.999999"), c(time(23, 59, 59, 999999)))
+        self.assertNotEqual(c("23:59:59.999999"), c(time(23, 59, 59)))   # no rollover/trim
+        self.assertIsNone(c(None))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

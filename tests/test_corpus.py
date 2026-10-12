@@ -63,10 +63,10 @@ class _MaskStrippingDialect(dl.PostgresDialect):
 
     name = "postgres-mask-strip"
 
-    def extraction_expr(self, column: str, reconcile: str) -> str:
+    def extraction_expr(self, column: str, reconcile: str, source_type: str = "") -> str:
         if column == "ip_address":
             return f'host("{column}")'
-        return super().extraction_expr(column, reconcile)
+        return super().extraction_expr(column, reconcile, source_type)
 
 
 class _StubDialect(dl.PostgresDialect):
