@@ -168,7 +168,8 @@ class TestDialectIsPluggable(unittest.TestCase):
 
 class TestPostgresTypeRulesSau549(unittest.TestCase):
     """SAU-549: uuid / bytea / interval / time / money / xml each get a type-pinned rule
-    instead of the `unrecognized_type` VARCHAR@0.5 fallback."""
+    instead of the `unrecognized_type` VARCHAR@0.5 fallback, and the three documented
+    input→output forms are named equivalences pinned at both edges."""
 
     def setUp(self):
         self.d = dl.PostgresDialect()
@@ -221,6 +222,43 @@ class TestPostgresTypeRulesSau549(unittest.TestCase):
         self.assertEqual(c("23:59:59.999999"), c(time(23, 59, 59, 999999)))
         self.assertNotEqual(c("23:59:59.999999"), c(time(23, 59, 59)))   # no rollover/trim
         self.assertIsNone(c(None))
+
+    def test_uuid_equivalence_and_boundary(self):
+        eq = lambda c, s: self.d.claim_equivalence(c, s, source_udt="uuid", data_type="uuid")
+        s = "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11"
+        for claim in ("A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11",
+                      "{a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11}",
+                      "a0eebc999c0b4ef8bb6d6bb9bd380a11",
+                      "a0eebc99-9c0b4ef8-bb6d6bb9-bd380a11"):
+            self.assertEqual(eq(claim, s), dl.EQ_UUID_CANONICAL_FORM, claim)
+        self.assertIsNone(eq("A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A12", s))   # other bits
+        self.assertIsNone(eq("a0eebc9-99c0b-4ef8-bb6d-6bb9bd380a11", s))   # bad grouping
+        self.assertIsNone(eq("A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11", s.upper()))  # not canonical
+        self.assertIsNone(self.d.claim_equivalence(s.upper(), s, source_udt="text",
+                                                   data_type="text"))
+
+    def test_bytea_equivalence_and_boundary(self):
+        eq = lambda c, s: self.d.claim_equivalence(c, s, source_udt="bytea", data_type="bytea")
+        self.assertEqual(eq("\\x0001fe ff", "0001feff"), dl.EQ_BYTEA_HEX_INPUT)
+        self.assertEqual(eq("\\xDEADBEEF", "deadbeef"), dl.EQ_BYTEA_HEX_INPUT)
+        self.assertEqual(eq("\\x", ""), dl.EQ_BYTEA_HEX_INPUT)
+        self.assertIsNone(eq("\\x0001feff", "0001fe"))       # a byte lost
+        self.assertIsNone(eq("\\x0 001", "0001"))            # whitespace inside a pair
+        self.assertIsNone(eq("abc", "616263"))                # escape format: out of scope
+
+    def test_interval_equivalence_and_boundary(self):
+        eq = lambda c, s: self.d.claim_equivalence(c, s, source_udt="interval",
+                                                   data_type="interval")
+        for claim, stored in (("4 hours", "04:00:00"), ("30 minutes", "00:30:00"),
+                              ("1 year 2 months 3 days", "1 year 2 mons 3 days"),
+                              ("-1 hour", "-01:00:00"), ("2 weeks ago", "-14 days"),
+                              ("1.5 hours", "01:30:00"), ("@ 3 mins", "00:03:00")):
+            self.assertEqual(eq(claim, stored), dl.EQ_INTERVAL_FIELDS, claim)
+        # fields are not cascaded: 1 day is not 24 hours, 1 mon is not 30 days
+        self.assertIsNone(eq("24 hours", "1 day"))
+        self.assertIsNone(eq("30 days", "1 mon"))
+        self.assertIsNone(eq("4 hours", "04:00:01"))
+        self.assertIsNone(eq("P1D", "1 day"))                 # ISO 8601: out of scope
 
 
 if __name__ == "__main__":

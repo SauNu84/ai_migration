@@ -25,10 +25,12 @@ Postgres behavior byte-for-byte (the §8 gate stays GREEN through the new seam).
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import sys
 from abc import ABC, abstractmethod
 from collections.abc import Iterator
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
@@ -78,6 +80,9 @@ PT_UNKNOWN = "unknown"
 # readout). An equivalence that hid its own application would be the invisible-
 # normalization defect one layer up — exactly what bullet 0 was written to catch.
 EQ_INET_HOST_MASK = "inet_host_mask"
+EQ_UUID_CANONICAL_FORM = "uuid_canonical_form"
+EQ_BYTEA_HEX_INPUT = "bytea_hex_input"
+EQ_INTERVAL_FIELDS = "interval_fields"
 
 
 class SourceDialect(ABC):
@@ -442,7 +447,13 @@ class PostgresDialect(SourceDialect):
     # ── Seam 5 ──
     def claim_equivalence(self, claimed: str | None, stored: str | None, *,
                           source_udt: str = "", data_type: str = "") -> str | None:
-        """`inet`/`cidr`: an omitted mask denotes the full host mask (SAU-516).
+        """Documented Postgres input-form → output-form equivalences.
+
+        Each is a property of the type's own I/O functions, derivable from the
+        PostgreSQL documentation without looking at any corpus (SAU-516's test); the
+        helpers below say which section and keep each rule to the narrowest scope.
+
+        `inet`/`cidr`: an omitted mask denotes the full host mask (SAU-516).
 
         `inet '203.0.113.42'` and `inet '203.0.113.42/32'` are the same value under the
         type's own equality operator — round-trip stable, nothing lost. The seed writes
@@ -456,12 +467,132 @@ class PostgresDialect(SourceDialect):
         """
         if claimed is None or stored is None:
             return None
-        if self.physical_token(data_type, source_udt) != PT_NETWORK:
+        tok = self.physical_token(data_type, source_udt)
+        if tok == PT_UUID:
+            return _pg_uuid_equivalence(claimed, stored)
+        if tok == PT_BINARY:
+            return _pg_bytea_equivalence(claimed, stored)
+        if tok == PT_INTERVAL:
+            return _pg_interval_equivalence(claimed, stored)
+        if tok != PT_NETWORK:
             return None
         if "/" in claimed:                 # the claim states a mask — compare it verbatim
             return None
         host_mask = "/128" if ":" in claimed else "/32"     # IPv6 vs IPv4
         return EQ_INET_HOST_MASK if stored == claimed + host_mask else None
+
+
+# ── Postgres equivalence helpers (SAU-549) ──────────────────────────────────────
+# Each rule decodes BOTH sides to the value the type stores and compares those; a claim
+# outside the documented input grammar returns None, so it stays a finding.
+
+_UUID_CANON = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+
+
+def _pg_uuid_equivalence(claimed: str, stored: str) -> str | None:
+    """uuid (PG docs §8.12): input accepts upper case, surrounding braces, and hyphens
+    after any group of four digits; "output is always in the standard form" — lower-case
+    8-4-4-4-12. Same 128 bits, so the same value."""
+    if not _UUID_CANON.match(stored):
+        return None
+    c = claimed.strip()
+    if c.startswith("{") and c.endswith("}"):
+        c = c[1:-1]
+    groups = c.split("-")
+    if not all(len(g) % 4 == 0 and g for g in groups):
+        return None
+    digits = "".join(groups)
+    if len(digits) != 32 or not re.fullmatch(r"[0-9A-Fa-f]{32}", digits):
+        return None
+    return EQ_UUID_CANONICAL_FORM if digits.lower() == stored.replace("-", "") else None
+
+
+def _pg_bytea_equivalence(claimed: str, stored: str) -> str | None:
+    """bytea hex format (PG docs §8.4.1): input is '\\x' then hex digit pairs, either
+    case, "whitespace is permitted between digit pairs". The wire form is the plain hex
+    of the stored bytes. Escape-format claims are out of scope and stay findings."""
+    if not claimed.startswith("\\x"):
+        return None
+    pairs = claimed[2:].split()
+    if any(len(t) % 2 for t in pairs):
+        return None                                      # whitespace splits a pair
+    try:
+        c = bytes.fromhex("".join(pairs))
+        s = bytes.fromhex(stored)
+    except ValueError:
+        return None
+    return EQ_BYTEA_HEX_INPUT if c == s else None
+
+
+_IV_MONTHS = {"millennium": 12000, "millenniums": 12000, "millennia": 12000,
+              "century": 1200, "centuries": 1200, "decade": 120, "decades": 120,
+              "year": 12, "years": 12, "y": 12, "yr": 12, "yrs": 12,
+              "month": 1, "months": 1, "mon": 1, "mons": 1}
+_IV_DAYS = {"week": 7, "weeks": 7, "w": 7, "day": 1, "days": 1, "d": 1}
+_IV_USEC = {"hour": 3_600_000_000, "hours": 3_600_000_000, "h": 3_600_000_000,
+            "hr": 3_600_000_000, "hrs": 3_600_000_000,
+            "minute": 60_000_000, "minutes": 60_000_000, "min": 60_000_000,
+            "mins": 60_000_000, "m": 60_000_000,
+            "second": 1_000_000, "seconds": 1_000_000, "sec": 1_000_000,
+            "secs": 1_000_000, "s": 1_000_000,
+            "millisecond": 1000, "milliseconds": 1000, "ms": 1000, "msec": 1000,
+            "msecs": 1000, "microsecond": 1, "microseconds": 1, "us": 1, "usec": 1,
+            "usecs": 1}
+_IV_TIME = re.compile(r"^([+-]?)(\d+):(\d{1,2})(?::(\d{1,2})(?:\.(\d{1,6}))?)?$")
+
+
+def _pg_interval_fields(text: str) -> tuple[int, int, int] | None:
+    """(months, days, microseconds) — the three fields a Postgres interval stores
+    (PG docs §8.5.4), parsed from the `postgres`-style verbose grammar: `[@] quantity
+    unit … [HH:MM[:SS[.f]]] [ago]`. Fields are NOT cascaded into each other ('25 hours'
+    stays 25 hours, as the type keeps it). Fractional quantities are accepted only on
+    the time units, where they cannot spill across fields; anything else → None."""
+    toks = text.strip().lower().split()
+    if toks and toks[0] == "@":
+        toks = toks[1:]
+    neg = bool(toks) and toks[-1] == "ago"
+    if neg:
+        toks = toks[:-1]
+    if not toks:
+        return None
+    months = days = usec = 0
+    i = 0
+    while i < len(toks):
+        t = toks[i]
+        tm = _IV_TIME.match(t)
+        if tm:
+            sign = -1 if tm.group(1) == "-" else 1
+            frac = (tm.group(5) or "").ljust(6, "0")
+            usec += sign * ((int(tm.group(2)) * 3600 + int(tm.group(3)) * 60
+                             + int(tm.group(4) or 0)) * 1_000_000 + int(frac or 0))
+            i += 1
+            continue
+        if i + 1 >= len(toks) or not re.fullmatch(r"[+-]?\d+(\.\d+)?", t):
+            return None
+        unit = toks[i + 1]
+        if unit in _IV_USEC:
+            q = Decimal(t) * _IV_USEC[unit]
+            if q != q.to_integral_value():
+                return None
+            usec += int(q)
+        elif "." in t:
+            return None
+        elif unit in _IV_MONTHS:
+            months += int(t) * _IV_MONTHS[unit]
+        elif unit in _IV_DAYS:
+            days += int(t) * _IV_DAYS[unit]
+        else:
+            return None
+        i += 2
+    return (-months, -days, -usec) if neg else (months, days, usec)
+
+
+def _pg_interval_equivalence(claimed: str, stored: str) -> str | None:
+    """interval (PG docs §8.5.4/§8.5.5): the verbose input ('4 hours', '1 year 2
+    months') is stored as months/days/µs and printed in IntervalStyle `postgres`
+    ('04:00:00', '1 year 2 mons'). Equal field triples are the same stored value."""
+    c, s = _pg_interval_fields(claimed), _pg_interval_fields(stored)
+    return EQ_INTERVAL_FIELDS if c is not None and c == s else None
 
 
 # ── SqlServerDialect — the second lane (SAU-324, against the SAU-323 seed) ───────
